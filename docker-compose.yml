@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgis/postgis:16-3.4
+    container_name: needle-lsst-postgres
+    environment:
+      POSTGRES_DB: needle_lsst
+      POSTGRES_USER: needle
+      POSTGRES_PASSWORD: needle_dev_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - needle_lsst_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U needle -d needle_lsst"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  needle_lsst_pgdata:

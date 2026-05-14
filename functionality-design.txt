@@ -1,0 +1,171 @@
+**NEEDLE-LSST Website – Professional Design & Development Specification (v2.0)**
+
+**Project Overview**  
+NEEDLE-LSST is a secure, multi-user web platform built around the **NEEDLE 2.0 classifier** for real-time analysis of LSST transient alerts streamed via Lasair. It automates AGN removal, quality control, and multi-class transient classification (TDE, SLSNe-I, SN Ia/Ibc/II, unclear, etc.), while providing astronomers with collaborative annotation, follow-up tracking, and personalized object curation.  
+
+The platform meets enterprise-grade standards: responsive dark-mode UI optimized for scientific workflows, role-based access control (RBAC), full audit logging, GDPR-compliant data handling, and high-performance SQL backend. All pages are mobile-first, WCAG 2.2 AA accessible, and optimized for low-latency display of Pan-STARRS (PS) image stamps and light-curve data.
+
+---
+
+### 1. Site Architecture & Navigation
+
+**Global Layout**  
+- **Top Navbar**: Logo (NEEDLE LSST), Search bar (global object search by name/coord/ZTF/Lasair ID), User avatar + dropdown (Profile, Settings, Logout, Admin for super-users).  
+- **Sidebar (collapsible)**:  
+  - Dashboard  
+  - Statistics  
+  - Object Browser  
+  - Starred Objects (Personal / Shared)  
+  - Follow-up Queue  
+  - Annotations & Comments 
+  - Model Monitor (NEEDLE 2.0) 
+  - Team & Sharing (for multi-user groups)  
+- **Footer**: Version, data source credits (Lasair / LSST), export buttons, feedback link.
+
+**Authentication**  
+- Institutional login (ORCID / Google / institutional SSO) + standard email/password with 2FA.  
+- Invitation-only team creation for shared starred objects.
+
+---
+
+### 2. Core Pages (Improved & Expanded)
+
+#### 2.1 Dashboard (Home)
+- **Welcome banner** with today’s LSST alert volume and NEEDLE 2.0 processing status.  
+- **Key Metrics Cards** (real-time, auto-refresh every 60 s):  
+  - Astronoted objects  
+  - Follow-up objects  
+  - Snoozed objects  
+  - Classified objects (today / total)  
+  - Starred objects (personal / shared with me)  
+- **Quick Actions**: “Classify New Alerts”, “View Today’s Histogram”, “Export Today’s Report”.  
+- **Recent Activity Feed**: Last 10 classified objects with thumbnail PS stamp, classification badge, confidence score, and “Star / Snooze / Follow-up” buttons.  
+- **NEEDLE 2.0 Health Widget**: AGN removal rate, average confidence, last training date.
+
+#### 2.2 Statistics Dashboard
+**Section A – NEEDLE Object Statistics**  
+Interactive KPI dashboard with date-range picker (default: last 30 days).  
+- Breakdown cards + donut charts: Astronoted / Follow-up / Snoozed / Classified / Starred (personal vs. shared).  
+- Click any card → filtered Object Browser.
+
+**Section B – Daily Classification Histogram & Trends**  
+- **Main Chart**: Stacked bar / line histogram (x-axis = days, y-axis = count).  
+  - Stacks by class: TDE | SLSNe-I | SN (Ia/Ibc/II grouped) | Unclear | AGN-removed | Other.  
+  - Toggleable probability overlay line (average confidence per day).  
+- Secondary charts:  
+  - Classification probability distribution (histogram + KDE).  
+  - Weekly/Monthly trend comparison (YoY or vs. previous period).  
+  - Export as PNG/CSV/PDF with one click.
+
+**Filters**: Time range, specific classes, confidence threshold, user (for team leads).
+
+#### 2.3 Object Browser (Main List Page)
+Modern, filterable, sortable data table (built with TanStack Table or AG-Grid for performance).  
+
+**Columns** (all sortable, resizable, toggleable):  
+- Object Name / Lasair ID (clickable → Detail page)  
+- RA / Dec (with copy-to-clipboard)  
+- Lasair Link (external icon)  
+- Last Classified (timestamp + user avatar)  
+- Latest PS Image Stamp (thumbnail, hover zoom, click opens lightbox)  
+- Latest Magnitude & Band (e.g., “r = 19.4 mag, 2026-04-06”)  
+- NEEDLE Classification (color-coded badge: TDE = teal, SN Ia = orange, etc.)  
+- Confidence Score (progress bar + numeric)  
+- User Comments (truncated preview)  
+- Actions: Star ⭐ / Snooze ⏰ / Follow-up 📌 / Annotate ✏️  
+
+**Advanced Features**  
+- Multi-select bulk actions (classify all selected, star, export JSON/CSV).  
+- Smart filters sidebar: Class, Score range (0–1), Date range, Magnitude, Has comments, My starred only, etc.  
+- Full-text search + coordinate cone search.  
+- Pagination + “Infinite scroll” option.  
+- Saved views (e.g., “My TDE candidates >0.8 confidence”).
+
+#### 2.4 Object Detail Page (replaces simple list view)
+Tabbed layout for deep analysis:  
+
+1. **Overview Tab**  
+   - Large PS image stamp carousel (latest 3–5 stamps with timestamps).  
+   - Coordinate map (Aladin Lite or SkyMap embed).  
+   - NEEDLE 2.0 Summary: Classification badge, score, confidence, AGN removal status, quality-check flags.  
+
+2. **Classification History Tab**  
+   - Timeline chart: Probability evolution over time (multi-line for each class).  
+   - Table: Timestamp | User/Model | Class | Score | Confidence | Comments.  
+
+3. **Images & Photometry Tab**  
+   - Full-resolution PS stamps with zoom & download.  
+   - Latest light curve (if available via Lasair API).  
+
+4. **Annotations & Comments Tab**  
+   - Threaded discussion (Markdown support, @mentions, rich-text editor).  
+   - Latest annotation + history.  
+
+5. **Follow-up & Starred Tab**  
+   - Follow-up status (Open / In Progress / Completed).  
+   - Add to personal or shared starred collection.  
+   - Invitation link for sharing with team.
+
+**Floating Action Button**: “Re-classify with NEEDLE 2.0” (triggers model on-demand).
+
+#### 2.5 Starred Objects & Team Sharing
+- **Personal Starred** tab + **Shared with Me** tab.  
+- **Team Management**: Create teams → invite by email/ORCID → granular permissions (view / annotate / classify).  
+- Shared starred objects appear in a dedicated “Team Collections” view with owner and last-updated info.  
+- One-click “Share via link” (time-limited or password-protected).
+
+#### 2.6 Follow-up Queue
+Dedicated Kanban-style board: To Do → Observing → Analyzed → Archived.  
+Drag-and-drop + filters by priority (high-confidence TDE candidates auto-prioritized).
+
+---
+
+### 3. Backend Architecture (Professional SQL Design)
+
+**Database Schema (PostgreSQL recommended for JSONB + PostGIS support)**  
+1. **users** – id, orcid, email, role (admin / team_lead / member / viewer), preferences.  
+2. **objects** – lasair_id (PK), ra, dec, latest_mag, band, ps_image_urls (JSONB array), last_classified.  
+3. **needle_classifications** – object_id, timestamp, model_version, class, score, confidence, agn_removed (bool), quality_flags, raw_probs (JSONB).  
+4. **user_object_interactions** – user_id, object_id, starred (bool), snoozed_until, follow_up_status, annotations (JSONB array of threads).  
+5. **follow_up** – object_id, priority, telescope, status, notes, assigned_user.  
+6. **audit_log** – full activity logging for compliance.
+
+**API Layer** (REST + GraphQL optional)  
+- Secure JWT + refresh tokens.  
+- WebSocket endpoint for real-time new LSST alerts.  
+- Rate-limited Lasair integration (pull streams + push classifications back if desired).
+
+---
+
+### 4. Additional Professional Features (Business Standards)
+
+- **Model Transparency**: “Explain NEEDLE 2.0” button showing feature importance (SHAP values) per object.  
+- **Export & Reporting**: One-click PDF/CSV reports with charts and object tables.  
+- **Notifications**: In-app + email for new high-confidence objects or team mentions.  
+- **Admin Panel**: User management, model retraining scheduler, usage analytics.  
+- **Security & Compliance**: HTTPS, data encryption at rest, audit logs, rate limiting, backup strategy.  
+- **Performance**: Indexed queries, CDN for PS images, lazy loading.  
+- **Analytics & Monitoring**: Google Analytics / Plausible + Sentry error tracking.  
+- **Internationalization**: Ready for English + future languages.
+
+---
+
+### 5. UI/UX & Design System Recommendations
+- **Theme**: Professional dark astronomy theme (#0f172a background, accent #00d4ff).  
+- **Components**: Consistent Tailwind + Headless UI + shadcn/ui or Material-UI scientific fork.  
+- **Data Visualization**: Chart.js / Plotly for interactive charts; Aladin Lite for sky maps.  
+- **Image Handling**: Lazy-loaded thumbnails with WebP fallback; lightbox gallery.  
+- **Accessibility**: Keyboard navigation, ARIA labels, high-contrast mode.
+
+---
+
+**Next Steps for Development**  
+1. Wireframes & Figma prototype (I can provide detailed component specs).  
+2. Backend schema migration script.  
+3. Frontend React/Next.js + TypeScript scaffold.  
+4. Lasair API integration layer.  
+5. Security audit & deployment (Docker + Kubernetes ready).
+
+This specification transforms your original outline into a production-ready, professional astronomy research platform that scales from individual users to large collaborations while keeping the core NEEDLE 2.0 classifier front-and-center.  
+
+Let me know which section you want to deep-dive first (e.g., full Figma-style component specs, database DDL, or API endpoint list). I’m ready to expand any part immediately.
