@@ -483,7 +483,7 @@ async function createTelescope(body) {
 const CANONICAL_FOLLOW_UP = new Set(["To Do", "Observing", "Completed", "Snooze"]);
 
 /**
- * Normalizes PATCH input: trims strings, drops null/empty, maps legacy labels.
+ * Normalizes PATCH input: trims strings, drops null/empty.
  */
 function normalizeFollowUpStatusForApi(value) {
   if (value === undefined || value === null) {
@@ -493,46 +493,23 @@ function normalizeFollowUpStatusForApi(value) {
   if (s === "" || s.toLowerCase() === "null") {
     return undefined;
   }
-  if (s === "Analyzed") {
-    return "Completed";
-  }
-  if (s === "Archived") {
-    return "Snooze";
-  }
-  if (s === "Completed") {
-    return "Completed";
-  }
   return s;
 }
 
-/** Maps DB row values to the labels the SPA expects (handles legacy `Analyzed`, `Archived`). */
+/** Maps DB enum/string to client `FollowUpStatus`; unknown values fall back to To Do. */
 function mapFollowUpForClient(raw) {
-  const n = normalizeFollowUpStatusForApi(raw);
-  if (n !== undefined && CANONICAL_FOLLOW_UP.has(n)) {
-    return n;
-  }
-  const fallback = raw == null ? "" : String(raw).trim();
-  if (fallback === "Completed") {
-    return "Completed";
-  }
-  if (fallback === "Analyzed") {
-    return "Completed";
-  }
-  if (fallback === "Archived") {
-    return "Snooze";
+  const s = raw == null ? "" : String(raw).trim();
+  if (CANONICAL_FOLLOW_UP.has(s)) {
+    return s;
   }
   return "To Do";
 }
 
+const VALID_PRIORITIES = new Set(["High", "Medium", "Low", "Monitor"]);
+
 function mapPriorityForClient(raw) {
   const p = raw == null || raw === "" ? "Low" : String(raw);
-  if (p === "Snoozed") {
-    return "Monitor";
-  }
-  if (["High", "Medium", "Low", "Monitor"].includes(p)) {
-    return p;
-  }
-  return "Low";
+  return VALID_PRIORITIES.has(p) ? p : "Low";
 }
 
 async function syncFollowUpRow(lasairId, update) {
@@ -547,7 +524,7 @@ async function syncFollowUpRow(lasairId, update) {
     return;
   }
 
-  if (update.priority !== undefined && !["High", "Medium", "Low", "Monitor"].includes(update.priority)) {
+  if (update.priority !== undefined && !VALID_PRIORITIES.has(update.priority)) {
     const error = new Error("Invalid priority (use High, Medium, Low, or Monitor).");
     error.statusCode = 400;
     throw error;

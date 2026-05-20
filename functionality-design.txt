@@ -115,7 +115,7 @@ Tabbed layout for deep analysis:
 - One-click “Share via link” (time-limited or password-protected).
 
 #### 2.6 Follow-up Queue
-Dedicated Kanban-style board: To Do → Observing → Completed → Snooze (terminal); card priority includes Monitor (was “Snoozed”).  
+Dedicated Kanban-style board: To Do → Observing → Completed → Snooze (terminal); card priority includes Monitor.  
 Drag-and-drop + filters by priority (high-confidence TDE candidates auto-prioritized).
 
 ---

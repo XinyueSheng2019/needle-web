@@ -32,21 +32,6 @@ BEGIN
 END
 $$;
 
--- Older installs used `Analyzed` instead of `Completed`. Enum labels are fixed after CREATE TYPE runs.
--- DO $$
--- BEGIN
---   IF EXISTS (SELECT 1 FROM pg_type WHERE typname = 'follow_up_status')
---      AND NOT EXISTS (
---        SELECT 1
---        FROM pg_enum e
---        JOIN pg_type t ON t.oid = e.enumtypid
---        WHERE t.typname = 'follow_up_status' AND e.enumlabel = 'Completed'
---      ) THEN
---     EXECUTE format('ALTER TYPE follow_up_status ADD VALUE %L', 'Completed');
---   END IF;
--- END
--- $$;
-
 CREATE TABLE IF NOT EXISTS users (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   orcid text UNIQUE,
@@ -266,24 +251,6 @@ ALTER TABLE follow_up ADD COLUMN IF NOT EXISTS telescope_codes text[] NOT NULL D
 UPDATE follow_up
 SET telescope_codes = ARRAY[telescope]
 WHERE telescope IS NOT NULL AND btrim(telescope) <> '' AND cardinality(telescope_codes) = 0;
-
-DO $$
-BEGIN
-  IF EXISTS (
-    SELECT 1
-    FROM pg_enum e
-    JOIN pg_type t ON t.oid = e.enumtypid
-    WHERE t.typname = 'follow_up_status' AND e.enumlabel = 'Completed'
-  ) THEN
-    UPDATE user_object_interactions
-    SET follow_up_status = 'Completed'::follow_up_status
-    WHERE follow_up_status::text = 'Completed';
-    UPDATE follow_up
-    SET status = 'Completed'::follow_up_status
-    WHERE status::text = 'Completed';
-  END IF;
-END
-$$;
 
 CREATE TABLE IF NOT EXISTS observing_telescopes (
   code text PRIMARY KEY CHECK (code ~ '^[A-Za-z0-9._-]{1,32}$'),
