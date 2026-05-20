@@ -1,10 +1,12 @@
 import {
   fallbackPlatformData,
+  type DailyClassification,
   type FollowUpStatus,
   health,
   type ObjectClass,
   type ObjectComment,
   type ObservingTelescope,
+  type PhotometryPoint,
   type PlatformData,
   type TransientObject,
 } from "./data";
@@ -16,10 +18,13 @@ import {
   useState,
   type CSSProperties,
   type DragEvent,
+  type MouseEvent,
+  type MutableRefObject,
   type ReactNode,
   type SyntheticEvent,
 } from "react";
 import {
+  fetchObjectDetail,
   fetchPlatformData,
   normalizeTransientObject,
   postObjectComment,
@@ -27,12 +32,12 @@ import {
   updateObjectInteraction,
   type ObjectInteractionUpdate,
 } from "./api";
+import { TelescopeVisibilityPanel } from "./TelescopeVisibilityPanel";
 
 const navigation = [
   { label: "Dashboard", id: "dashboard" },
   { label: "Object List", id: "object-list" },
-  { label: "Follow-up Queue", id: "follow-up-queue" },
-  { label: "Team & Sharing", id: "team-sharing" },
+  { label: "Follow-ups", id: "follow-up-queue" },
 ] as const;
 
 type PageId = (typeof navigation)[number]["id"] | "object-detail" | "admin";
@@ -82,19 +87,19 @@ type SnoozeRedoState = {
   exiting: boolean;
 };
 
-/** Next follow-up step when using the row action (cycles stages; Archived is off the kanban but still reachable from the list). */
+/** Next follow-up step when using the row action (cycles stages; Snooze is off the kanban but still reachable from the list). */
 const FOLLOW_UP_CYCLE: Record<FollowUpStatus, FollowUpStatus> = {
-  Archived: "To Do",
+  Snooze: "To Do",
   "To Do": "Observing",
-  Observing: "Analyzed",
-  Analyzed: "Archived",
+  Observing: "Completed",
+  Completed: "Snooze",
 };
 
 function isFollowUpTagActive(object: TransientObject) {
-  return object.followUp === "To Do" || object.followUp === "Observing" || object.followUp === "Analyzed";
+  return object.followUp === "To Do" || object.followUp === "Observing" || object.followUp === "Completed";
 }
 
-/** Objects shown on the Follow-up Queue board: the three active workflow lanes only (not Archived). */
+/** Objects shown on the Follow-up Queue board: the three active workflow lanes only (not Snooze). */
 function isOnFollowUpBoard(object: TransientObject) {
   return isFollowUpTagActive(object);
 }
@@ -134,7 +139,7 @@ function objectMatchesSearch(object: TransientObject, searchTerm: string) {
 
 /**
  * Checks whether an object matches the selected Object List tag.
- * The follow-up tag matches objects in an active workflow stage (To Do, Observing, or Analyzed), not Archived.
+ * The follow-up tag matches objects in an active workflow stage (To Do, Observing, or Completed), not Snooze.
  */
 function objectMatchesTag(object: TransientObject, tagFilter: ObjectTagFilter | null) {
   if (!tagFilter) {
@@ -176,7 +181,59 @@ function parseLastClassified(lastClassified: string) {
   return Date.now() - minutesAgo * 60_000;
 }
 
-/** Sort key for Follow-up Queue: last user/follow-up/classification touch, then detection time. */
+/** Sort key: High (4) → Medium (3) → Low (2) → Monitor (1) for kanban ordering within each lane. */
+function followUpPriorityRank(p: TransientObject["priority"]): number {
+  if (p === "High") {
+    return 4;
+  }
+  if (p === "Medium") {
+    return 3;
+  }
+  if (p === "Low") {
+    return 2;
+  }
+  if (p === "Monitor") {
+    return 1;
+  }
+  return 0;
+}
+
+/** Order cards by priority (High first), then by most recent queue/classification touch. */
+function compareKanbanCardsInLane(a: TransientObject, b: TransientObject): number {
+  const byPriority = followUpPriorityRank(b.priority) - followUpPriorityRank(a.priority);
+  if (byPriority !== 0) {
+    return byPriority;
+  }
+  return getObjectActionSortTime(b) - getObjectActionSortTime(a);
+}
+
+type LaneOrderRef = MutableRefObject<Partial<Record<FollowUpStatus, string[]>>>;
+
+/**
+ * Keeps kanban card order stable when object data changes (e.g. priority).
+ * Order is established from priority sort on first paint per lane; new cards (e.g. after drag) append sorted; full re-sort only on page refresh.
+ */
+function orderKanbanLaneStable(lane: FollowUpStatus, inLane: TransientObject[], orderRef: LaneOrderRef): TransientObject[] {
+  const ids = new Set(inLane.map((o) => o.lasairId));
+  const byId = new Map(inLane.map((o) => [o.lasairId, o]));
+  const prev = orderRef.current[lane];
+
+  if (!prev?.length) {
+    const sorted = [...inLane].sort(compareKanbanCardsInLane);
+    orderRef.current[lane] = sorted.map((o) => o.lasairId);
+    return sorted;
+  }
+
+  const kept = prev.filter((id) => ids.has(id));
+  const newIds = [...ids].filter((id) => !kept.includes(id));
+  const newcomers = newIds.map((id) => byId.get(id)).filter(Boolean) as TransientObject[];
+  newcomers.sort(compareKanbanCardsInLane);
+  const nextOrder = [...kept, ...newcomers.map((o) => o.lasairId)];
+  orderRef.current[lane] = nextOrder;
+  return nextOrder.map((id) => byId.get(id)).filter(Boolean) as TransientObject[];
+}
+
+/** Sort key for Follow-up Queue tie-break: last user/follow-up/classification touch, then detection time. */
 function getObjectActionSortTime(object: TransientObject) {
   const fromAction = Date.parse(object.lastActionAt);
   if (!Number.isNaN(fromAction)) {
@@ -229,12 +286,300 @@ function formatLastClassified(lastClassified: string) {
 /** `<select>` value: open the inline form for a new facility (added with "Add to card"). */
 const KANBAN_ADD_TELESCOPE_SELECT_VALUE = "__kanban_add_telescope__";
 
-function kanbanTelescopeLabel(code: string, catalog: ObservingTelescope[]) {
-  return catalog.find((entry) => entry.code === code)?.displayName ?? code;
+const LC_BAND_COLORS: Record<string, string> = {
+  g: "#4ade80",
+  r: "#f87171",
+  i: "#fb923c",
+  z: "#c084fc",
+  u: "#38bdf8",
+  y: "#fbbf24",
+  default: "#94a3b8",
+};
+
+function objectRaDecDegrees(object: TransientObject): { ra: number; dec: number } {
+  const ra = parseFloat(object.ra);
+  const dec = parseFloat(String(object.dec).replace(/^\+/, ""));
+  return { ra, dec: Number.isFinite(dec) ? dec : 0 };
 }
 
-/** Local date (yyyy-mm-dd) and time (HH:mm) parts for calendar + clock inputs. */
-function splitRevisitLocal(iso: string | null) {
+function buildAladinLiteUrl(object: TransientObject): string {
+  const { ra, dec } = objectRaDecDegrees(object);
+  const decStr = dec >= 0 ? `+${dec}` : String(dec);
+  const target = `${ra} ${decStr}`;
+  const survey = encodeURIComponent("CDS/P/DSS2/color");
+  const fov = 0.12;
+  const addCatalog = false;
+  const addTool = false;
+  const width = 1000;
+  const height = 1000;
+  const saveImage = false;
+
+
+  return `https://aladin.cds.unistra.fr/AladinLite/?target=${encodeURIComponent(target)}&fov=${fov}&survey=${survey}&addCatalog=${addCatalog}&addTool=${addTool}&width=${width}&height=${height}&saveImage=${saveImage}`;
+}
+
+function syntheticPhotometry(object: TransientObject): PhotometryPoint[] {
+  const m = parseFloat(object.magnitude);
+  const mag = Number.isFinite(m) ? m : 20;
+  const base = 60775;
+  const bands = ["g", "r", "i"];
+  const pts: PhotometryPoint[] = [];
+  for (let d = 0; d < 6; d += 1) {
+    for (let b = 0; b < bands.length; b += 1) {
+      pts.push({
+        mjd: base + d + b * 0.02,
+        band: bands[b],
+        mag: mag - d * 0.08 + b * 0.12 + ((d + b) % 3) * 0.03,
+        magErr: 0.04,
+      });
+    }
+  }
+  return pts;
+}
+
+/** UTC calendar day (YYYY-MM-DD) for an MJD instant; ties photometry detections to daily NEEDLE snapshots. */
+function mjdToUtcCalendarDay(mjd: number): string {
+  const ms = (mjd - 40587) * 86400000;
+  return new Date(ms).toISOString().slice(0, 10);
+}
+
+/** Stable key for one photometry detection (one point on the light curve). */
+function detectionClassificationKey(point: PhotometryPoint): string {
+  return `${point.mjd}:${String(point.band || "?").toLowerCase()}`;
+}
+
+const PER_DETECTION_PRIOR_CLASSES: ObjectClass[] = [
+  "TDE",
+  "SLSNe-I",
+  "SN Ia",
+  "SN Ibc",
+  "SN II",
+  "Unclear",
+  "AGN-removed",
+  "Other",
+];
+
+function detHashU01(input: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < input.length; i += 1) {
+    h ^= input.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0) / 0xffff_ffff;
+}
+
+/** d(mag)/d(MJD) using neighbors in the same band (fewer points → single-sided). */
+function bandNeighborhoodSlope(point: PhotometryPoint, photometry: PhotometryPoint[]): number {
+  const b = String(point.band || "?").toLowerCase();
+  const series = photometry
+    .filter((p) => String(p.band || "?").toLowerCase() === b && Number.isFinite(p.mag) && Number.isFinite(p.mjd))
+    .sort((a, c) => a.mjd - c.mjd);
+  const ix = series.findIndex(
+    (p) => p.mjd === point.mjd && String(p.band || "?").toLowerCase() === b,
+  );
+  if (ix < 0 || series.length < 2) {
+    return 0;
+  }
+  const prev = series[ix - 1];
+  const next = series[ix + 1];
+  if (prev && next) {
+    return (next.mag - prev.mag) / (next.mjd - prev.mjd);
+  }
+  if (next) {
+    return (next.mag - point.mag) / (next.mjd - point.mjd);
+  }
+  if (prev) {
+    return (point.mag - prev.mag) / (point.mjd - prev.mjd);
+  }
+  return 0;
+}
+
+/**
+ * NEEDLE-style class probabilities for a single detection: priors from the DB snapshot of that UTC day
+ * (if any) or from the object row, then perturbed deterministically from magnitude, band, and local slope.
+ */
+function classificationForDetection(
+  point: PhotometryPoint,
+  photometry: PhotometryPoint[],
+  object: TransientObject,
+  dataSource: "database" | "fallback",
+  apiByDay: Map<string, DailyClassification>,
+): DailyClassification {
+  const day = mjdToUtcCalendarDay(point.mjd);
+  const api = apiByDay.get(day);
+  const eps = 1e-4;
+  const priors: Record<string, number> = {};
+
+  let modelVersion: string;
+  let classifiedAtIso: string;
+
+  if (dataSource === "database" && api) {
+    for (const c of PER_DETECTION_PRIOR_CLASSES) {
+      const v = api.rawProbs[c];
+      priors[c] = typeof v === "number" && v > 0 ? v : eps;
+    }
+    const sumP = PER_DETECTION_PRIOR_CLASSES.reduce((acc, c) => acc + priors[c], 0);
+    if (sumP < 1e-6) {
+      for (const c of PER_DETECTION_PRIOR_CLASSES) {
+        priors[c] = (object.classProbabilities[c] ?? 0) + eps;
+      }
+    }
+    modelVersion = api.modelVersion?.trim() ? api.modelVersion : "NEEDLE 2.0";
+    classifiedAtIso = api.classifiedAt;
+  } else {
+    for (const c of PER_DETECTION_PRIOR_CLASSES) {
+      priors[c] = (object.classProbabilities[c] ?? 0) + eps;
+    }
+    const s = PER_DETECTION_PRIOR_CLASSES.reduce((acc, c) => acc + priors[c], 0);
+    if (s < 1e-6) {
+      const u = 1 / PER_DETECTION_PRIOR_CLASSES.length;
+      for (const c of PER_DETECTION_PRIOR_CLASSES) {
+        priors[c] = u;
+      }
+    }
+    modelVersion = object.classifiedBy?.trim() ? object.classifiedBy : "NEEDLE 2.0";
+    classifiedAtIso = `${day}T12:00:00.000Z`;
+  }
+
+  const slope = bandNeighborhoodSlope(point, photometry);
+  const brighten = -slope;
+  const mags = photometry.map((p) => p.mag).filter(Number.isFinite);
+  const minM = mags.length ? Math.min(...mags) : Number(point.mag);
+  const maxM = mags.length ? Math.max(...mags) : Number(point.mag);
+  const magSpan = maxM - minM || 1;
+  const magN = (Number(point.mag) - minM) / magSpan;
+
+  const weights: Record<string, number> = {};
+  for (const c of PER_DETECTION_PRIOR_CLASSES) {
+    let w = priors[c];
+    const hDet = 0.52 + 0.96 * detHashU01(`${point.mjd.toFixed(5)}|${point.band}|${c}|x`);
+    const hMag = 0.82 + 0.36 * (1 - magN);
+    let slopeBias = 1;
+    if (c === "TDE") {
+      slopeBias *= 1 + 0.14 * Math.max(0, brighten);
+    }
+    if (c === "SLSNe-I") {
+      slopeBias *= 1 + 0.1 * Math.max(0, brighten);
+    }
+    if (c === "SN Ia") {
+      slopeBias *= 1 + 0.06 / (1 + Math.abs(brighten));
+    }
+    if (c === "AGN-removed") {
+      slopeBias *= 1 + 0.05 * Math.max(0, magN - 0.55);
+    }
+    w *= hDet * hMag * slopeBias;
+    weights[c] = w;
+  }
+
+  let sumW = PER_DETECTION_PRIOR_CLASSES.reduce((acc, c) => acc + weights[c], 0);
+  if (sumW <= 0) {
+    sumW = 1;
+  }
+  const rawProbs: Record<string, number> = {};
+  let top: ObjectClass = "Unclear";
+  let best = -1;
+  for (const c of PER_DETECTION_PRIOR_CLASSES) {
+    const p = weights[c] / sumW;
+    rawProbs[c] = p;
+    if (p > best) {
+      best = p;
+      top = c;
+    }
+  }
+
+  return {
+    day,
+    classifiedAt: classifiedAtIso,
+    class: top,
+    confidence: best,
+    rawProbs,
+    modelVersion: `${modelVersion} · per-detection view`,
+  };
+}
+
+function buildClassificationByDetection(
+  photometry: PhotometryPoint[],
+  object: TransientObject,
+  dataSource: "database" | "fallback",
+  apiHistory: DailyClassification[],
+): Map<string, DailyClassification> {
+  const map = new Map<string, DailyClassification>();
+  const apiByDay = new Map<string, DailyClassification>();
+  for (const row of apiHistory) {
+    apiByDay.set(row.day, row);
+  }
+  for (const p of photometry) {
+    map.set(
+      detectionClassificationKey(p),
+      classificationForDetection(p, photometry, object, dataSource, apiByDay),
+    );
+  }
+  return map;
+}
+
+function kanbanTelescopeLabel(code: string, catalog: ObservingTelescope[]) {
+  const found =
+    catalog.find((entry) => entry.code === code) ??
+    catalog.find((entry) => entry.code.toLowerCase() === code.toLowerCase());
+  return found?.displayName ?? code;
+}
+
+/** Latest comment for kanban cards: prefer thread head (author + time); else API preview body only. */
+type LatestCardComment = { body: string; publisher: string | null; createdAt: string | null };
+
+function latestCommentForCard(object: TransientObject): LatestCardComment | null {
+  const thread = object.comments[0];
+  if (thread?.body?.trim()) {
+    return {
+      body: thread.body.trim(),
+      publisher: thread.publisher?.trim() || null,
+      createdAt: thread.createdAt || null,
+    };
+  }
+  const preview = object.comment?.trim();
+  if (preview) {
+    return { body: preview, publisher: null, createdAt: null };
+  }
+  return null;
+}
+
+/** Build a drag bitmap with a fixed pixel width — the live card uses `width: 100%`, which resolves wrong when captured outside the lane grid. */
+function mountKanbanDragPreview(source: HTMLElement, event: DragEvent<HTMLElement>): HTMLElement {
+  const rect = source.getBoundingClientRect();
+  const clone = source.cloneNode(true) as HTMLElement;
+  clone.querySelectorAll<HTMLDetailsElement>("details").forEach((detailsElement) => {
+    detailsElement.open = false;
+  });
+  clone.classList.add("task-card--drag-preview");
+  Object.assign(clone.style, {
+    position: "fixed",
+    left: "-10000px",
+    top: "0",
+    width: `${Math.round(rect.width)}px`,
+    maxWidth: `${Math.round(rect.width)}px`,
+    boxSizing: "border-box",
+    pointerEvents: "none",
+    margin: "0",
+    zIndex: "2147483647",
+  });
+  document.body.appendChild(clone);
+  void clone.offsetWidth;
+  const offsetX = Math.round(event.clientX - rect.left);
+  const offsetY = Math.round(event.clientY - rect.top);
+  event.dataTransfer.setDragImage(clone, offsetX, offsetY);
+  return clone;
+}
+
+/** Follow-up board column title (PostgreSQL / API still use `Completed`). */
+function followUpQueueLaneLabel(lane: FollowUpStatus): string {
+  if (lane === "Completed") {
+    return "Completed";
+  }
+  return lane;
+}
+
+/** Local date (yyyy-mm-dd) and time (HH:mm) from a stored ISO timestamp (for editing). */
+function splitRevisitLocal(iso: string | null): { date: string; time: string } {
   if (!iso) {
     return { date: "", time: "" };
   }
@@ -242,6 +587,18 @@ function splitRevisitLocal(iso: string | null) {
   if (Number.isNaN(d.getTime())) {
     return { date: "", time: "" };
   }
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return {
+    date: `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`,
+    time: `${pad(d.getHours())}:${pad(d.getMinutes())}`,
+  };
+}
+
+/** Default revisit when none is set: calendar date of open + 7 days, 10:00 local. */
+function defaultRevisitPlusSevenLocal(): { date: string; time: string } {
+  const d = new Date();
+  d.setDate(d.getDate() + 7);
+  d.setHours(10, 0, 0, 0);
   const pad = (n: number) => String(n).padStart(2, "0");
   return {
     date: `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`,
@@ -465,6 +822,14 @@ function App() {
     });
   }, []);
 
+  const canEditStarred = platformData.session?.canEditStarred ?? true;
+
+  useEffect(() => {
+    if (!canEditStarred && activeTagFilter === "starred") {
+      setActiveTagFilter(null);
+    }
+  }, [canEditStarred, activeTagFilter]);
+
   /**
    * Replaces one object in the current frontend state after the API returns a saved record.
    * To change matching behavior manually, replace `lasairId` with another stable object key.
@@ -551,6 +916,11 @@ function App() {
    * To add a new button action manually, extend `ObjectInteractionUpdate` and map it here.
    */
   const handleObjectInteraction: InteractionHandler = async (object, update) => {
+    if (update.starred !== undefined && !canEditStarred) {
+      setInteractionMessage("Starred is only editable for private workspace accounts.");
+      return;
+    }
+
     const previousObject = object;
     const previousObjectIndex = objectListObjects.findIndex((candidate) => candidate.lasairId === object.lasairId);
     const optimisticUpdate: Partial<TransientObject> = {};
@@ -573,6 +943,8 @@ function App() {
 
     if (update.priority !== undefined) {
       optimisticUpdate.priority = update.priority;
+    } else if (update.followUp === "Completed") {
+      optimisticUpdate.priority = "Low";
     }
 
     if (update.revisitAt !== undefined) {
@@ -581,11 +953,7 @@ function App() {
 
     if (update.telescopeCodes !== undefined) {
       const codes = [
-        ...new Set(
-          update.telescopeCodes
-            .map((c) => String(c).trim().toUpperCase().replace(/\s+/g, "_"))
-            .filter(Boolean),
-        ),
+        ...new Set(update.telescopeCodes.map((c) => String(c).trim().replace(/\s+/g, "_")).filter(Boolean)),
       ];
       optimisticUpdate.telescopeCodes = codes;
       optimisticUpdate.telescopeCode = codes[0] ?? null;
@@ -596,10 +964,7 @@ function App() {
         optimisticUpdate.telescopeCodes = [];
         optimisticUpdate.telescopeCode = null;
       } else {
-        const one = String(update.telescope)
-          .trim()
-          .toUpperCase()
-          .replace(/\s+/g, "_");
+        const one = String(update.telescope).trim().replace(/\s+/g, "_");
         optimisticUpdate.telescopeCodes = one ? [one] : [];
         optimisticUpdate.telescopeCode = one || null;
       }
@@ -814,6 +1179,7 @@ function App() {
             sortDirection={sortDirection}
             snoozeRedo={snoozeRedo}
             selectedObject={selectedObject}
+            canEditStarred={canEditStarred}
             onInteraction={handleObjectInteraction}
             onPostComment={handlePostObjectComment}
             onTagFilterChange={(tagFilter) => {
@@ -834,8 +1200,7 @@ function App() {
 
         <footer className="footer">
           <span>NEEDLE-LSST v0.1.0</span>
-          <span>Data credits: Lasair / LSST / Pan-STARRS</span>
-          <span>GDPR-ready audit and export workflow</span>
+          <span>Data credits: Lasair/ Zwicky Transient Facility / Rubin Observatory / Pan-STARRS</span>
         </footer>
       </div>
     </div>
@@ -856,6 +1221,7 @@ function ActivePage({
   sortDirection,
   snoozeRedo,
   selectedObject,
+  canEditStarred,
   onInteraction,
   onPostComment,
   onTagFilterChange,
@@ -874,6 +1240,7 @@ function ActivePage({
   sortDirection: SortDirection;
   snoozeRedo: SnoozeRedoState | null;
   selectedObject: TransientObject;
+  canEditStarred: boolean;
   onInteraction: InteractionHandler;
   onPostComment: CommentPostHandler;
   onTagFilterChange: (tagFilter: ObjectTagFilter) => void;
@@ -893,6 +1260,7 @@ function ActivePage({
           sortField={sortField}
           sortDirection={sortDirection}
           snoozeRedo={snoozeRedo}
+          canEditStarred={canEditStarred}
           onInteraction={onInteraction}
           onTagFilterChange={onTagFilterChange}
           onSortFieldChange={onSortFieldChange}
@@ -901,9 +1269,17 @@ function ActivePage({
         />
       );
     case "object-detail":
-      return <ObjectDetail object={selectedObject} onInteraction={onInteraction} onPostComment={onPostComment} />;
-    case "team-sharing":
-      return <Collaboration teams={platformData.teams} />;
+      return (
+        <ObjectDetail
+          object={selectedObject}
+          onInteraction={onInteraction}
+          onPostComment={onPostComment}
+          telescopes={platformData.telescopes}
+          dataSource={dataSource}
+          onTelescopeAdded={onTelescopeAdded}
+          canEditStarred={canEditStarred}
+        />
+      );
     case "follow-up-queue":
       return (
         <FollowUpQueue
@@ -994,7 +1370,7 @@ function Dashboard({ objects }: { objects: TransientObject[] }) {
 
   return (
     <section className="section-grid">
-      <Panel title="Recent Activity Feed" eyebrow="Last 10 classifications">
+      <Panel title="Recent Activity Feed" eyebrow="Top 10 Recent Classifications">
         <div className="activity-list">
           {activity.map((item) => (
             <div className="activity-item" key={item.title}>
@@ -1082,6 +1458,7 @@ function ObjectBrowser({
   sortField,
   sortDirection,
   snoozeRedo,
+  canEditStarred,
   onInteraction,
   onTagFilterChange,
   onSortFieldChange,
@@ -1094,6 +1471,7 @@ function ObjectBrowser({
   sortField: ObjectSortField;
   sortDirection: SortDirection;
   snoozeRedo: SnoozeRedoState | null;
+  canEditStarred: boolean;
   onInteraction: InteractionHandler;
   onTagFilterChange: (tagFilter: ObjectTagFilter) => void;
   onSortFieldChange: (sortField: ObjectSortField) => void;
@@ -1145,8 +1523,8 @@ function ObjectBrowser({
     <Section
       id="object-list"
       eyebrow="Object List"
-      title="Filterable, sortable candidate table"
-      copy="Designed for TanStack Table or AG-Grid integration when the backend is connected. This first version includes the full column model, smart filters, saved views, and bulk-action affordances."
+      title="Filterable, sortable NEEDLE 2.0 candidate table"
+      copy=""
     >
       {searchTerm.trim() ? (
         <p className="search-note">
@@ -1166,6 +1544,12 @@ function ObjectBrowser({
                 type="button"
                 className={`object-tag tag-starred${activeTagFilter === "starred" ? " active" : ""}`}
                 aria-pressed={activeTagFilter === "starred"}
+                disabled={!canEditStarred}
+                title={
+                  canEditStarred
+                    ? "Filter by starred objects"
+                    : "Starred lists are only available for private workspace accounts."
+                }
                 onClick={() => onTagFilterChange("starred")}
               >
                 starred
@@ -1235,6 +1619,7 @@ function ObjectBrowser({
                   index={index}
                   redoIndex={redoIndex}
                   snoozeRedo={snoozeRedo}
+                  canEditStarred={canEditStarred}
                   onInteraction={onInteraction}
                   onRedoSnooze={onRedoSnooze}
                 />
@@ -1259,6 +1644,7 @@ function FragmentWithRedo({
   index,
   redoIndex,
   snoozeRedo,
+  canEditStarred,
   onInteraction,
   onRedoSnooze,
 }: {
@@ -1266,6 +1652,7 @@ function FragmentWithRedo({
   index: number;
   redoIndex: number;
   snoozeRedo: SnoozeRedoState | null;
+  canEditStarred: boolean;
   onInteraction: InteractionHandler;
   onRedoSnooze: () => void;
 }) {
@@ -1274,7 +1661,7 @@ function FragmentWithRedo({
       {snoozeRedo && redoIndex === index ? (
         <RedoRow object={snoozeRedo.object} exiting={snoozeRedo.exiting} onRedoSnooze={onRedoSnooze} />
       ) : null}
-      <ObjectRow object={object} onInteraction={onInteraction} />
+      <ObjectRow object={object} canEditStarred={canEditStarred} onInteraction={onInteraction} />
     </>
   );
 }
@@ -1310,7 +1697,15 @@ function RedoRow({
  * One row in the object table.
  * The folded action menu uses the action list: star, follow-up, promote, snooze.
  */
-function ObjectRow({ object, onInteraction }: { object: TransientObject; onInteraction: InteractionHandler }) {
+function ObjectRow({
+  object,
+  canEditStarred,
+  onInteraction,
+}: {
+  object: TransientObject;
+  canEditStarred: boolean;
+  onInteraction: InteractionHandler;
+}) {
   const actionMenuRef = useRef<HTMLDetailsElement>(null);
   const selectedActionIcons = getSelectedActionIcons(object);
   const classifiedDisplay = formatLastClassified(object.lastClassified);
@@ -1373,8 +1768,13 @@ function ObjectRow({ object, onInteraction }: { object: TransientObject; onInter
               className={object.starred ? "active" : undefined}
               aria-pressed={object.starred}
               aria-label={`${object.starred ? "Unstar" : "Star"} ${object.name}`}
+              disabled={!canEditStarred}
               onClick={() => chooseAction({ starred: !object.starred })}
-              title="star"
+              title={
+                canEditStarred
+                  ? "Star or unstar (private workspace)"
+                  : "Starred is only editable for private workspace accounts."
+              }
             >
               <ActionIcon name="star" />
             </button>
@@ -1441,6 +1841,452 @@ function getSelectedActionIcons(object: TransientObject): ActionIconName[] {
   return icons.length ? icons : ["menu"];
 }
 
+type LightCurveHover = {
+  clientX: number;
+  clientY: number;
+  utcDay: string;
+  point: PhotometryPoint;
+  classification: DailyClassification | null;
+};
+
+function MultiBandLightCurve({
+  points,
+  classificationByDetection,
+}: {
+  points: PhotometryPoint[];
+  classificationByDetection: Map<string, DailyClassification>;
+}) {
+  const [hover, setHover] = useState<LightCurveHover | null>(null);
+
+  const updateHover = (event: MouseEvent<SVGGElement>, point: PhotometryPoint) => {
+    const utcDay = mjdToUtcCalendarDay(point.mjd);
+    const key = detectionClassificationKey(point);
+    setHover({
+      clientX: event.clientX,
+      clientY: event.clientY,
+      utcDay,
+      point,
+      classification: classificationByDetection.get(key) ?? null,
+    });
+  };
+
+  if (!points.length) {
+    return <p className="muted-value">No photometry loaded for this object.</p>;
+  }
+
+  const mjds = points.map((p) => p.mjd);
+  const mags = points.map((p) => p.mag);
+  const minMjd = Math.min(...mjds);
+  const maxMjd = Math.max(...mjds);
+  const minMag = Math.min(...mags) - 0.2;
+  const maxMag = Math.max(...mags) + 0.2;
+  const padL = 54;
+  const padR = 12;
+  const padT = 16;
+  const padB = 48;
+  const W = 468;
+  const H = 252;
+  const innerW = W - padL - padR;
+  const innerH = H - padT - padB;
+  const spanMjd = maxMjd - minMjd || 1;
+  const spanMag = maxMag - minMag || 1;
+  const xScale = (mj: number) => padL + ((mj - minMjd) / spanMjd) * innerW;
+  const yScale = (magVal: number) => padT + ((magVal - minMag) / spanMag) * innerH;
+
+  const byBand = new Map<string, PhotometryPoint[]>();
+  for (const p of points) {
+    const b = (p.band || "?").toLowerCase();
+    if (!byBand.has(b)) {
+      byBand.set(b, []);
+    }
+    byBand.get(b)!.push(p);
+  }
+  for (const arr of byBand.values()) {
+    arr.sort((a, b) => a.mjd - b.mjd);
+  }
+
+  const gridT = [0, 0.25, 0.5, 0.75, 1];
+  const vw = typeof globalThis.window !== "undefined" ? globalThis.window.innerWidth : 1024;
+  const vh = typeof globalThis.window !== "undefined" ? globalThis.window.innerHeight : 768;
+  const cardW = 288;
+  const cardH = 220;
+  const hoverPosition =
+    hover &&
+    (() => {
+      const left = Math.min(Math.max(10, hover.clientX + 14), vw - cardW - 10);
+      const top = Math.min(Math.max(10, hover.clientY + 14), vh - cardH - 10);
+      return { left, top };
+    })();
+
+  return (
+    <div
+      className="lightcurve-chart-wrap"
+      onMouseLeave={() => setHover(null)}
+    >
+      {hover && hoverPosition ? (
+        <div
+          className="lightcurve-hover-card"
+          role="tooltip"
+          style={{ left: hoverPosition.left, top: hoverPosition.top }}
+        >
+          <div className="lightcurve-hover-section">
+            <h5 className="lightcurve-hover-title">Detection</h5>
+            <p className="lightcurve-hover-meta">
+              MJD {hover.point.mjd.toFixed(4)} · UTC day {hover.utcDay}
+            </p>
+            <p className="lightcurve-hover-meta">
+              Band <strong>{hover.point.band}</strong>, mag{" "}
+              <strong>{Number.isFinite(hover.point.mag) ? hover.point.mag.toFixed(3) : "—"}</strong>
+              {hover.point.magErr != null && Number.isFinite(hover.point.magErr)
+                ? ` ± ${hover.point.magErr.toFixed(3)}`
+                : null}
+            </p>
+          </div>
+          <div className="lightcurve-hover-section lightcurve-hover-section--needle">
+            <h5 className="lightcurve-hover-title">NEEDLE (this detection)</h5>
+            {hover.classification ? (
+              <>
+                <p className="lightcurve-hover-class-row">
+                  <Badge
+                    label={hover.classification.class}
+                    tone={classColor[hover.classification.class as ObjectClass] ?? "slate"}
+                  />
+                  <span className="lightcurve-hover-conf">
+                    {Math.round(hover.classification.confidence * 100)}% conf.
+                  </span>
+                </p>
+                <p className="lightcurve-hover-meta">
+                  {hover.classification.modelVersion}
+                  <time dateTime={hover.classification.classifiedAt}>
+                    {" "}
+                    · {formatCommentTime(hover.classification.classifiedAt)}
+                  </time>
+                </p>
+                <ul className="lightcurve-hover-probs">
+                  {Object.entries(hover.classification.rawProbs)
+                    .sort((a, b) => b[1] - a[1])
+                    .map(([k, v]) => (
+                      <li key={k}>
+                        {k}: {(v * 100).toFixed(1)}%
+                      </li>
+                    ))}
+                </ul>
+              </>
+            ) : (
+              <p className="lightcurve-hover-none">No classification computed for this point.</p>
+            )}
+          </div>
+        </div>
+      ) : null}
+      <svg className="lightcurve-svg" viewBox={`0 0 ${W} ${H}`} role="img" aria-label="Multi-band light curve">
+        <title>Light curve from photometry JSON</title>
+        {gridT.map((t) => {
+          const mj = minMjd + t * spanMjd;
+          const x = xScale(mj);
+          return (
+            <g key={`gx-${t}`}>
+              <line
+                x1={x}
+                y1={padT}
+                x2={x}
+                y2={H - padB}
+                stroke="rgba(148,163,184,0.14)"
+                strokeWidth={1}
+              />
+              <text x={x} y={H - padB + 16} textAnchor="middle" fill="#94a3b8" fontSize={9}>
+                {mj.toFixed(2)}
+              </text>
+            </g>
+          );
+        })}
+        {gridT.map((t) => {
+          const magVal = minMag + t * spanMag;
+          const y = yScale(magVal);
+          return (
+            <g key={`gy-${t}`}>
+              <line
+                x1={padL}
+                y1={y}
+                x2={W - padR}
+                y2={y}
+                stroke="rgba(148,163,184,0.14)"
+                strokeWidth={1}
+              />
+              <text x={padL - 8} y={y + 4} textAnchor="end" fill="#94a3b8" fontSize={9}>
+                {magVal.toFixed(2)}
+              </text>
+            </g>
+          );
+        })}
+        <text
+          x={padL + innerW / 2}
+          y={H - 4}
+          textAnchor="middle"
+          fill="#94a3b8"
+          fontSize={10}
+          fontWeight={600}
+          className="chart-axis-title"
+        >
+          Modified Julian Date (MJD)
+        </text>
+        <text
+          transform={`translate(13, ${padT + innerH / 2}) rotate(-90)`}
+          textAnchor="middle"
+          fill="#94a3b8"
+          fontSize={10}
+          fontWeight={600}
+          className="chart-axis-title"
+        >
+          Magnitude (mag)
+        </text>
+        {[...byBand.entries()].map(([band, pts]) => {
+          const color = LC_BAND_COLORS[band] ?? LC_BAND_COLORS.default;
+          const d = pts
+            .map((p, i) => `${i === 0 ? "M" : "L"} ${xScale(p.mjd)} ${yScale(p.mag)}`)
+            .join(" ");
+          return <path key={`line-${band}`} d={d} fill="none" stroke={color} strokeWidth={2} strokeLinejoin="round" />;
+        })}
+        {[...byBand.entries()].flatMap(([band, pts]) =>
+          pts.map((p, i) => (
+            <g
+              key={`${band}-${i}-${p.mjd}`}
+              onMouseEnter={(e) => updateHover(e, p)}
+              onMouseMove={(e) => updateHover(e, p)}
+            >
+              <circle
+                cx={xScale(p.mjd)}
+                cy={yScale(p.mag)}
+                r={12}
+                fill="transparent"
+                className="lightcurve-hit"
+              />
+              <circle
+                cx={xScale(p.mjd)}
+                cy={yScale(p.mag)}
+                r={3.5}
+                fill={LC_BAND_COLORS[band] ?? LC_BAND_COLORS.default}
+                stroke="rgba(15,23,42,0.85)"
+                strokeWidth={1}
+                className="lightcurve-point"
+              />
+            </g>
+          )),
+        )}
+      </svg>
+      <ul className="lightcurve-legend">
+        {[...byBand.keys()].map((b) => (
+          <li key={b}>
+            <span className="legend-swatch" style={{ background: LC_BAND_COLORS[b] ?? LC_BAND_COLORS.default }} />
+            {b}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function TelescopeFacilityEditor({
+  object,
+  telescopes,
+  dataSource,
+  onInteraction,
+  onTelescopeAdded,
+  hint = "Pick a facility from the dropdown to add it to the list (no duplicates). Save commits; Clear removes all. Use “Add new telescope…” to register a code.",
+  variant = "popover",
+}: {
+  object: TransientObject;
+  telescopes: ObservingTelescope[];
+  dataSource: "database" | "fallback";
+  onInteraction: InteractionHandler;
+  onTelescopeAdded: (telescope: ObservingTelescope) => void;
+  hint?: string;
+  variant?: "popover" | "inline";
+}) {
+  const [telescopeCodesDraft, setTelescopeCodesDraft] = useState<string[]>(() => [...(object.telescopeCodes ?? [])]);
+  const [pickTelescope, setPickTelescope] = useState("");
+  const [newTelCode, setNewTelCode] = useState("");
+  const [newTelName, setNewTelName] = useState("");
+
+  useEffect(() => {
+    setTelescopeCodesDraft([...(object.telescopeCodes ?? [])]);
+    setPickTelescope("");
+    setNewTelCode("");
+    setNewTelName("");
+  }, [object.lasairId, object.lastActionAt, (object.telescopeCodes ?? []).join("\u0001"), object.telescopeCode]);
+
+  const commitNewTelescopeDraft = async () => {
+    if (pickTelescope !== KANBAN_ADD_TELESCOPE_SELECT_VALUE) {
+      return;
+    }
+    const raw = newTelCode.trim();
+    if (!raw) {
+      return;
+    }
+    const code = raw.toUpperCase().replace(/\s+/g, "_");
+    if (telescopeCodesDraft.includes(code)) {
+      setPickTelescope("");
+      setNewTelCode("");
+      setNewTelName("");
+      return;
+    }
+    const existing = telescopes.find((t) => t.code === code);
+    if (existing) {
+      setTelescopeCodesDraft((d) => [...d, code]);
+    } else if (dataSource === "fallback") {
+      onTelescopeAdded({ code, displayName: newTelName.trim() || code });
+      setTelescopeCodesDraft((d) => [...d, code]);
+    } else {
+      try {
+        const created = await postObservingTelescope(raw, newTelName.trim() || undefined);
+        onTelescopeAdded(created);
+        setTelescopeCodesDraft((d) => [...d, created.code]);
+      } catch (error) {
+        console.error(error);
+        return;
+      }
+    }
+    setPickTelescope("");
+    setNewTelCode("");
+    setNewTelName("");
+  };
+
+  const saveTelescopeList = (closeTrigger?: HTMLElement | null) => {
+    onInteraction(object, { telescopeCodes: [...telescopeCodesDraft] });
+    if (closeTrigger) {
+      closeKanbanDetails(closeTrigger);
+    }
+  };
+
+  const clearTelescopeList = (closeTrigger?: HTMLElement | null) => {
+    setTelescopeCodesDraft([]);
+    setPickTelescope("");
+    setNewTelCode("");
+    setNewTelName("");
+    onInteraction(object, { telescopeCodes: [] });
+    if (closeTrigger) {
+      closeKanbanDetails(closeTrigger);
+    }
+  };
+
+  const inner = (
+    <>
+      <p
+        className={`kanban-popover-hint kanban-telescope-hint${
+          variant === "inline" ? " detail-telescope-hint" : ""
+        }`}
+      >
+        {hint}
+      </p>
+      <ul className="kanban-telescope-chips" aria-label="Telescopes assigned to this object">
+        {telescopeCodesDraft.map((code) => (
+          <li key={code} className="kanban-telescope-chip">
+            <span>{kanbanTelescopeLabel(code, telescopes)}</span>
+            <button
+              type="button"
+              className="kanban-telescope-chip-remove"
+              aria-label={`Remove ${code}`}
+              onClick={() => setTelescopeCodesDraft((d) => d.filter((c) => c !== code))}
+            >
+              ×
+            </button>
+          </li>
+        ))}
+      </ul>
+      <label className="kanban-popover-label">
+        Add from list or register new
+        <select
+          value={pickTelescope}
+          onChange={(event) => {
+            const value = event.target.value;
+            if (value === "") {
+              setPickTelescope("");
+              return;
+            }
+            if (value === KANBAN_ADD_TELESCOPE_SELECT_VALUE) {
+              setPickTelescope(value);
+              setNewTelCode("");
+              setNewTelName("");
+              return;
+            }
+            setTelescopeCodesDraft((d) => (d.includes(value) ? d : [...d, value]));
+            setPickTelescope("");
+          }}
+        >
+          <option value="">Choose facility…</option>
+          {telescopes
+            .filter((t) => !telescopeCodesDraft.includes(t.code))
+            .map((telescope) => (
+              <option key={telescope.code} value={telescope.code}>
+                {telescope.displayName} ({telescope.code})
+              </option>
+            ))}
+          <option value={KANBAN_ADD_TELESCOPE_SELECT_VALUE}>Add new telescope…</option>
+        </select>
+      </label>
+      {pickTelescope === KANBAN_ADD_TELESCOPE_SELECT_VALUE ? (
+        <div className="kanban-new-telescope">
+          <input
+            placeholder="Code e.g. ESO_4M"
+            value={newTelCode}
+            onChange={(event) => setNewTelCode(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                void commitNewTelescopeDraft();
+              }
+            }}
+          />
+          <input
+            placeholder="Display name (optional)"
+            value={newTelName}
+            onChange={(event) => setNewTelName(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                void commitNewTelescopeDraft();
+              }
+            }}
+          />
+          <button
+            type="button"
+            className="secondary kanban-telescope-register-btn"
+            disabled={!newTelCode.trim()}
+            onClick={() => void commitNewTelescopeDraft()}
+          >
+            Register &amp; add
+          </button>
+        </div>
+      ) : null}
+      <div className="kanban-popover-actions">
+        {variant === "inline" ? (
+          <>
+            <button type="button" onClick={() => saveTelescopeList()}>
+              Save telescopes
+            </button>
+            <button type="button" className="secondary" onClick={() => clearTelescopeList()}>
+              Clear all
+            </button>
+          </>
+        ) : (
+          <>
+            <button type="button" onClick={(event) => saveTelescopeList(event.currentTarget)}>
+              Save
+            </button>
+            <button type="button" className="secondary" onClick={(event) => clearTelescopeList(event.currentTarget)}>
+              Clear
+            </button>
+          </>
+        )}
+      </div>
+    </>
+  );
+
+  if (variant === "inline") {
+    return <div className="detail-telescope-editor">{inner}</div>;
+  }
+  return inner;
+}
+
 /**
  * Detailed single-object analysis page.
  * To add tabs or more scientific panels manually, add new `Panel` blocks inside the `detail-grid`.
@@ -1449,17 +2295,74 @@ function ObjectDetail({
   object,
   onInteraction,
   onPostComment,
+  telescopes,
+  dataSource,
+  onTelescopeAdded,
+  canEditStarred,
 }: {
   object: TransientObject;
   onInteraction: InteractionHandler;
   onPostComment: CommentPostHandler;
+  telescopes: ObservingTelescope[];
+  dataSource: "database" | "fallback";
+  onTelescopeAdded: (telescope: ObservingTelescope) => void;
+  canEditStarred: boolean;
 }) {
   const [draftComment, setDraftComment] = useState("");
   const [localComments, setLocalComments] = useState(object.comments);
+  const [detailPhotometry, setDetailPhotometry] = useState<PhotometryPoint[]>([]);
+  const [detailHistory, setDetailHistory] = useState<DailyClassification[]>([]);
+  const [detailLoadState, setDetailLoadState] = useState<"idle" | "loading" | "ready">("idle");
 
   useEffect(() => {
     setLocalComments(object.comments);
   }, [object.comments, object.lasairId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      if (dataSource === "database") {
+        setDetailLoadState("loading");
+        const payload = await fetchObjectDetail(object.lasairId);
+        if (cancelled) {
+          return;
+        }
+        setDetailPhotometry(payload.photometry);
+        setDetailHistory(payload.classificationHistory);
+        setDetailLoadState("ready");
+      } else {
+        setDetailPhotometry([]);
+        setDetailHistory([]);
+        setDetailLoadState("idle");
+      }
+    };
+    void load();
+    return () => {
+      cancelled = true;
+    };
+  }, [object.lasairId, dataSource]);
+
+  const photometry = useMemo(() => {
+    let pts = detailPhotometry;
+    if ((!pts || pts.length === 0) && dataSource === "fallback") {
+      pts = syntheticPhotometry(object);
+    }
+    return pts;
+  }, [detailPhotometry, dataSource, object]);
+
+  const classificationByDetection = useMemo(
+    () => buildClassificationByDetection(photometry, object, dataSource, detailHistory),
+    [photometry, object, dataSource, detailHistory],
+  );
+
+  const sortedProbs = useMemo(
+    () => Object.entries(object.classProbabilities).sort((a, b) => b[1] - a[1]),
+    [object.classProbabilities],
+  );
+
+  // const legacyImage = object.psImageUrls?.[0] ?? null;
+  const aladinUrl = buildAladinLiteUrl(object);
+  const { ra, dec } = objectRaDecDegrees(object);
 
   /**
    * Adds a comment to the Object Detail page and persists it through the parent handler.
@@ -1484,56 +2387,186 @@ function ObjectDetail({
     <Section
       id="object-detail"
       eyebrow="Object Detail"
-      title={`${object.name} deep analysis workspace`}
-      copy="A tabbed detail page brings together image stamps, coordinates, model transparency, classification history, annotations, and follow-up ownership."
+      title={`${object.name}`}
+      // copy="Coordinates, Aladin reference, NEEDLE probabilities, photometry-driven light curves with per-detection class estimates, tags, follow-up facilities, and comments."
+    copy=""
     >
       <div className="detail-grid">
-        <Panel title="Overview" eyebrow="Latest stamp carousel">
-          <div className="stamp-row">
-            {["Latest", "Previous", "Reference"].map((label, index) => (
-              <ImageStamp key={label} hue={`${190 + index * 28}deg`} label={label} />
-            ))}
+        <div className="detail-tag-row">
+          <span className="detail-tag-label">Tags</span>
+          <div className="object-tags object-tags--detail">
+            <button
+              type="button"
+              className={`object-tag tag-starred${object.starred ? " active" : ""}`}
+              disabled={!canEditStarred}
+              aria-pressed={object.starred}
+              onClick={() => onInteraction(object, { starred: !object.starred })}
+            >
+              starred
+            </button>
+            <button
+              type="button"
+              className={`object-tag tag-promoted${object.promoted ? " active" : ""}`}
+              aria-pressed={object.promoted}
+              onClick={() => onInteraction(object, { promoted: !object.promoted })}
+            >
+              promoted
+            </button>
+            <button
+              type="button"
+              className={`object-tag tag-follow-up${isFollowUpTagActive(object) ? " active" : ""}`}
+              aria-pressed={isFollowUpTagActive(object)}
+              onClick={() =>
+                onInteraction(object, { followUp: isFollowUpTagActive(object) ? "Snooze" : "To Do" })
+              }
+            >
+              follow-up
+            </button>
           </div>
-          <div className="summary-card">
-            <Badge label={object.classification} tone={classColor[object.classification]} />
+        </div>
+
+        <Panel title="Overview" eyebrow="Sky position & Template image">
+          <div className="detail-overview-skies">
+            <div className="detail-aladin-wrap">
+              <span className="detail-embed-label">Aladin Lite</span>
+              <iframe
+                title="Aladin sky atlas reference image"
+                className="detail-aladin-frame"
+                src={aladinUrl}
+                loading="lazy"
+                allowFullScreen
+                allow="fullscreen"
+              />
+            </div>
+          </div>
+          <dl className="detail-coords-grid">
+            <div>
+              <dt>RA (°)</dt>
+              <dd>{Number.isFinite(ra) ? ra.toFixed(6) : object.ra}</dd>
+            </div>
+            <div>
+              <dt>Dec (°)</dt>
+              <dd>{Number.isFinite(dec) ? (dec >= 0 ? `+${dec.toFixed(6)}` : dec.toFixed(6)) : object.dec}</dd>
+            </div>
+            <div>
+              <dt>TNS class</dt>
+              <dd>{object.tnsClass ?? "—"}</dd>
+            </div>
+            <div>
+              <dt>TNS name</dt>
+              <dd>{object.tnsName ?? "—"}</dd>
+            </div>
+            <div>
+              <dt>NEEDLE class</dt>
+              <dd>
+                <Badge label={object.classification} tone={classColor[object.classification]} />
+              </dd>
+            </div>
+            <div>
+              <dt>Top confidence</dt>
+              <dd>{Math.round(object.confidence * 100)}%</dd>
+            </div>
+          </dl>
+          {/* <div className="summary-card summary-card--compact">
             <Progress value={object.confidence} />
             <p>
               AGN removed: <strong>{object.agnRemoved ? "Yes" : "No"}</strong>
             </p>
-            <p>Quality flags: {object.qualityFlags.join(", ")}</p>
+            <p>Quality flags: {object.qualityFlags.length ? object.qualityFlags.join(", ") : "—"}</p>
+          </div> */}
+        </Panel>
+
+        <Panel title="Light curve" eyebrow="Photometry & per-detection NEEDLE predictions">
+          <p className="detail-cadence-note">
+            Class probabilities for each available detection are estimated from NEEDLE 2.0 model output from the discovery day to current detection day with step size of 1 day at minima. Hover any point for detection metadata and the full probability vector.
+          </p>
+          {dataSource === "database" && detailLoadState === "loading" ? (
+            <p className="muted-value">Loading photometry…</p>
+          ) : null}
+          <MultiBandLightCurve points={photometry} classificationByDetection={classificationByDetection} />
+          <div className="detail-prob-block detail-prob-block--below-curve">
+            <h4 className="detail-subheading">Latest class probabilities:</h4>
+            <div className="detail-prob-table-wrap">
+              <table className="detail-prob-table">
+                <thead>
+                  <tr>
+                    <th>Class</th>
+                    <th>Probability</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {sortedProbs.length ? (
+                    sortedProbs.map(([cls, p]) => (
+                      <tr key={cls}>
+                        <td>{cls}</td>
+                        <td>{(p * 100).toFixed(1)}%</td>
+                      </tr>
+                    ))
+                  ) : (
+                    <tr>
+                      <td colSpan={2} className="muted-value">
+                        No probability vector on this row.
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
           </div>
         </Panel>
 
-        <Panel title="Classification History" eyebrow="Probability evolution">
-          <div className="timeline">
-            {["Model scored initial alert", "Astronomer annotation added", "Follow-up status changed"].map(
-              (event, index) => (
-                <div key={event}>
-                  <span>{index + 1}</span>
-                  <p>{event}</p>
-                </div>
-              ),
-            )}
+        <Panel title="Follow-up queue" eyebrow="Follow-up & Priority settings">
+          <label className="detail-field">
+            <span>Follow-up status</span>
+            <select
+              value={object.followUp}
+              onChange={(event) => onInteraction(object, { followUp: event.target.value as FollowUpStatus })}
+            >
+              {(["To Do", "Observing", "Completed", "Snooze"] as const).map((status) => (
+                <option key={status} value={status}>
+                  {status}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="detail-field">
+            <span>Priority</span>
+            <select
+              value={object.priority}
+              onChange={(event) =>
+                onInteraction(object, { priority: event.target.value as TransientObject["priority"] })
+              }
+            >
+              {(["High", "Medium", "Low", "Monitor"] as const).map((priority) => (
+                <option key={priority} value={priority}>
+                  {priority}
+                </option>
+              ))}
+            </select>
+          </label>
+          <div className="detail-telescope-visibility-merge">
+            <span className="detail-embed-label">Observing facilities &amp; night visibility</span>
+            <TelescopeFacilityEditor
+              object={object}
+              telescopes={telescopes}
+              dataSource={dataSource}
+              onInteraction={onInteraction}
+              onTelescopeAdded={onTelescopeAdded}
+              hint="Choose a facility from the dropdown to add it (duplicates ignored). Save persists telescope_codes on this object and updates the altitude plot below."
+              variant="inline"
+            />
+            <div className="detail-visibility-wrap detail-visibility-wrap--merged">
+              <div className="detail-visibility-body">
+                <TelescopeVisibilityPanel
+                  key={object.lasairId}
+                  raDeg={ra}
+                  decDeg={dec}
+                  telescopes={telescopes}
+                  telescopeCodes={[...(object.telescopeCodes ?? []), object.telescopeCode ?? ""].filter(Boolean)}
+                />
+              </div>
+            </div>
           </div>
-        </Panel>
-
-        <Panel title="Images & Photometry" eyebrow="Lasair-ready">
-          <div className="lightcurve" role="img" aria-label="Mock light curve">
-            {[22, 35, 48, 62, 74, 67, 58, 45].map((point, index) => (
-              <span key={`${point}-${index}`} style={{ height: `${point}%` }} />
-            ))}
-          </div>
-        </Panel>
-
-        <Panel title="Follow-up & Starred" eyebrow="Collaboration">
-          <Status label="Status" value={object.followUp} />
-          <Status label="Priority" value={object.priority} />
-          <button type="button" onClick={() => onInteraction(object, { starred: !object.starred })}>
-            {object.starred ? "Remove from starred" : "Add to starred"}
-          </button>
-          <button type="button" className="secondary" onClick={() => onInteraction(object, { followUp: "To Do" })}>
-            Mark for follow-up
-          </button>
         </Panel>
 
         <Panel title="Comments" eyebrow="Object discussion">
@@ -1571,34 +2604,6 @@ function ObjectDetail({
 }
 
 /**
- * Team and sharing page.
- * To change team cards manually, update the API/fallback `teams` data or add controls inside this component.
- */
-function Collaboration({ teams }: { teams: PlatformData["teams"] }) {
-  return (
-    <Section
-      id="team-sharing"
-      eyebrow="Starred Objects & Team Sharing"
-      title="Personal and shared candidate curation"
-      copy="Teams can create collections, invite users by email or ORCID, and grant view, annotate, or classify permissions."
-    >
-      <div className="cards-three">
-        {teams.map((team) => (
-          <article className="collection-card" key={team.name}>
-            <h3>{team.name}</h3>
-            <p>{team.permission}</p>
-            <div>
-              <span>{team.members} members</span>
-              <span>{team.collections} collections</span>
-            </div>
-          </article>
-        ))}
-      </div>
-    </Section>
-  );
-}
-
-/**
  * One draggable follow-up card with priority, revisit reminder, and telescope controls.
  */
 function KanbanFollowUpCard({
@@ -1614,13 +2619,9 @@ function KanbanFollowUpCard({
   onInteraction: InteractionHandler;
   onTelescopeAdded: (telescope: ObservingTelescope) => void;
 }) {
-  const priorities = ["High", "Medium", "Low"] as const;
-  const [revisitDate, setRevisitDate] = useState(() => splitRevisitLocal(object.revisitAt).date);
-  const [revisitTime, setRevisitTime] = useState(() => splitRevisitLocal(object.revisitAt).time);
-  const [telescopeCodesDraft, setTelescopeCodesDraft] = useState<string[]>(() => [...(object.telescopeCodes ?? [])]);
-  const [pickTelescope, setPickTelescope] = useState("");
-  const [newTelCode, setNewTelCode] = useState("");
-  const [newTelName, setNewTelName] = useState("");
+  const priorities = ["High", "Medium", "Low", "Monitor"] as const;
+  const [revisitDate, setRevisitDate] = useState("");
+  const [revisitTime, setRevisitTime] = useState("");
 
   const telescopeSubmetaLine = (() => {
     const fromList = object.telescopeCodes ?? [];
@@ -1639,23 +2640,21 @@ function KanbanFollowUpCard({
   }, [object.revisitAt]);
 
   useEffect(() => {
-    const next = splitRevisitLocal(object.revisitAt);
-    setRevisitDate(next.date);
-    setRevisitTime(next.time);
+    if (object.revisitAt) {
+      const next = splitRevisitLocal(object.revisitAt);
+      setRevisitDate(next.date);
+      setRevisitTime(next.time);
+    } else {
+      setRevisitDate("");
+      setRevisitTime("");
+    }
   }, [object.lasairId, object.revisitAt]);
-
-  useEffect(() => {
-    setTelescopeCodesDraft([...(object.telescopeCodes ?? [])]);
-    setPickTelescope("");
-    setNewTelCode("");
-    setNewTelName("");
-  }, [object.lasairId, object.lastActionAt, (object.telescopeCodes ?? []).join("\u0001"), object.telescopeCode]);
 
   const applyRevisit = (): boolean => {
     if (!revisitDate) {
       return false;
     }
-    const timePart = revisitTime || "09:00";
+    const timePart = revisitTime.trim() || "10:00";
     const parsed = new Date(`${revisitDate}T${timePart}`);
     if (Number.isNaN(parsed.getTime())) {
       return false;
@@ -1670,65 +2669,23 @@ function KanbanFollowUpCard({
     }
   };
 
-  const appendPickToDraft = async () => {
-    if (!pickTelescope) {
+  const onRevisitToolToggle = (event: SyntheticEvent<HTMLDetailsElement>) => {
+    onKanbanToolToggle(event);
+    if (!event.currentTarget.open) {
       return;
     }
-    if (pickTelescope === KANBAN_ADD_TELESCOPE_SELECT_VALUE) {
-      const raw = newTelCode.trim();
-      if (!raw) {
-        return;
-      }
-      const code = raw.toUpperCase().replace(/\s+/g, "_");
-      if (telescopeCodesDraft.includes(code)) {
-        setPickTelescope("");
-        setNewTelCode("");
-        setNewTelName("");
-        return;
-      }
-      const existing = telescopes.find((t) => t.code === code);
-      if (existing) {
-        setTelescopeCodesDraft((d) => [...d, code]);
-      } else if (dataSource === "fallback") {
-        onTelescopeAdded({ code, displayName: newTelName.trim() || code });
-        setTelescopeCodesDraft((d) => [...d, code]);
-      } else {
-        try {
-          const created = await postObservingTelescope(raw, newTelName.trim() || undefined);
-          onTelescopeAdded(created);
-          setTelescopeCodesDraft((d) => [...d, created.code]);
-        } catch (error) {
-          console.error(error);
-          return;
-        }
-      }
-      setPickTelescope("");
-      setNewTelCode("");
-      setNewTelName("");
-      return;
+    if (object.revisitAt) {
+      const next = splitRevisitLocal(object.revisitAt);
+      setRevisitDate(next.date);
+      setRevisitTime(next.time);
+    } else {
+      const next = defaultRevisitPlusSevenLocal();
+      setRevisitDate(next.date);
+      setRevisitTime(next.time);
     }
-    if (!telescopeCodesDraft.includes(pickTelescope)) {
-      setTelescopeCodesDraft((d) => [...d, pickTelescope]);
-    }
-    setPickTelescope("");
   };
 
-  const saveTelescopeList = (trigger: HTMLElement) => {
-    onInteraction(object, { telescopeCodes: [...telescopeCodesDraft] });
-    closeKanbanDetails(trigger);
-  };
-
-  const clearTelescopeList = (trigger: HTMLElement) => {
-    setTelescopeCodesDraft([]);
-    setPickTelescope("");
-    setNewTelCode("");
-    setNewTelName("");
-    onInteraction(object, { telescopeCodes: [] });
-    closeKanbanDetails(trigger);
-  };
-
-  const addToCardDisabled =
-    !pickTelescope || (pickTelescope === KANBAN_ADD_TELESCOPE_SELECT_VALUE && !newTelCode.trim());
+  const latestComment = latestCommentForCard(object);
 
   return (
     <>
@@ -1764,11 +2721,14 @@ function KanbanFollowUpCard({
               </div>
             </div>
           </details>
-          <details className="kanban-tool" data-kanban-tool="revisit" onToggle={onKanbanToolToggle}>
+          <details className="kanban-tool" data-kanban-tool="revisit" onToggle={onRevisitToolToggle}>
             <summary className="kanban-icon-button" aria-label="Revisit reminder" title="Revisit reminder">
               <ActionIcon name="clock" />
             </summary>
             <div className="kanban-popover">
+              <p className="kanban-popover-hint">
+                With no reminder set, opening this panel defaults to one week from today at 10:00. Change the date and time to match your plan.
+              </p>
               <label className="kanban-popover-label">
                 Revisit date
                 <input type="date" value={revisitDate} onChange={(event) => setRevisitDate(event.target.value)} />
@@ -1809,77 +2769,14 @@ function KanbanFollowUpCard({
               <ActionIcon name="telescope" />
             </summary>
             <div className="kanban-popover kanban-popover--wide">
-      <p className="kanban-popover-hint kanban-telescope-hint">Add facilities to this card (no duplicate codes). Save commits the list; Clear removes all.</p>
-              <ul className="kanban-telescope-chips" aria-label="Telescopes on this card">
-                {telescopeCodesDraft.map((code) => (
-                  <li key={code} className="kanban-telescope-chip">
-                    <span>{kanbanTelescopeLabel(code, telescopes)}</span>
-                    <button
-                      type="button"
-                      className="kanban-telescope-chip-remove"
-                      aria-label={`Remove ${code}`}
-                      onClick={() => setTelescopeCodesDraft((d) => d.filter((c) => c !== code))}
-                    >
-                      ×
-                    </button>
-                  </li>
-                ))}
-              </ul>
-              <label className="kanban-popover-label">
-                Add from list or register new
-                <select
-                  value={pickTelescope}
-                  onChange={(event) => {
-                    setPickTelescope(event.target.value);
-                    if (event.target.value !== KANBAN_ADD_TELESCOPE_SELECT_VALUE) {
-                      setNewTelCode("");
-                      setNewTelName("");
-                    }
-                  }}
-                >
-                  <option value="">Choose facility…</option>
-                  {telescopes
-                    .filter((t) => !telescopeCodesDraft.includes(t.code))
-                    .map((telescope) => (
-                      <option key={telescope.code} value={telescope.code}>
-                        {telescope.displayName} ({telescope.code})
-                      </option>
-                    ))}
-                  <option value={KANBAN_ADD_TELESCOPE_SELECT_VALUE}>Add new telescope…</option>
-                </select>
-              </label>
-              {pickTelescope === KANBAN_ADD_TELESCOPE_SELECT_VALUE ? (
-                <div className="kanban-new-telescope">
-                  <input
-                    placeholder="Code e.g. ESO_4M"
-                    value={newTelCode}
-                    onChange={(event) => setNewTelCode(event.target.value)}
-                  />
-                  <input
-                    placeholder="Display name (optional)"
-                    value={newTelName}
-                    onChange={(event) => setNewTelName(event.target.value)}
-                  />
-                </div>
-              ) : null}
-              <div className="kanban-telescope-pick-actions">
-                <button
-                  type="button"
-                  className="secondary kanban-telescope-add-btn"
-                  disabled={addToCardDisabled}
-                  onClick={() => void appendPickToDraft()}
-                >
-                  Add to card
-                </button>
-              </div>
-              <div className="kanban-popover-actions">
-                <button type="button" onClick={(event) => saveTelescopeList(event.currentTarget)}>
-                  Save
-                </button>
-                <button type="button" className="secondary" onClick={(event) => clearTelescopeList(event.currentTarget)}>
-                  Clear
-                </button>
-              </div>
+              <TelescopeFacilityEditor
+                object={object}
+                telescopes={telescopes}
+                dataSource={dataSource}
+                onInteraction={onInteraction}
+                onTelescopeAdded={onTelescopeAdded}
+                hint="Pick a facility from the dropdown to add it; Save commits the same telescope_codes as object detail. Use “Add new telescope…” + Register & add for new codes."
+              />
             </div>
           </details>
         </div>
@@ -1893,6 +2790,24 @@ function KanbanFollowUpCard({
         </a>
       </strong>
       <small className="task-card-id">{object.lasairId}</small>
+      {latestComment ? (
+        <div className="kanban-card-comment" title={latestComment.body}>
+          <span className="kanban-card-comment-label">Latest comment</span>
+          {latestComment.publisher || latestComment.createdAt ? (
+            <div className="kanban-card-comment-meta">
+              {latestComment.publisher ? (
+                <span className="kanban-card-comment-author">{latestComment.publisher}</span>
+              ) : null}
+              {latestComment.createdAt ? (
+                <time className="kanban-card-comment-time" dateTime={latestComment.createdAt}>
+                  {formatCommentTime(latestComment.createdAt)}
+                </time>
+              ) : null}
+            </div>
+          ) : null}
+          <p className="kanban-card-comment-body">{latestComment.body}</p>
+        </div>
+      ) : null}
       {revisitSummary || telescopeSubmetaLine ? (
         <div className="kanban-card-submeta">
           {revisitSummary ? (
@@ -1914,7 +2829,7 @@ function KanbanFollowUpCard({
 }
 
 /**
- * Kanban-style follow-up queue: three lanes (To Do, Observing, Analyzed). Archived status is only from the object list.
+ * Kanban-style follow-up queue: three lanes (To Do, Observing, Completed). Snooze status is only from the object list.
  * Drops call the same API as the object list.
  */
 function FollowUpQueue({
@@ -1930,8 +2845,15 @@ function FollowUpQueue({
   onInteraction: InteractionHandler;
   onTelescopeAdded: (telescope: ObservingTelescope) => void;
 }) {
-  const lanes = ["To Do", "Observing", "Analyzed"] as const;
+  const lanes = ["To Do", "Observing", "Completed"] as const;
+  const laneOrderRef = useRef<Partial<Record<FollowUpStatus, string[]>>>({});
   const [dragOverLane, setDragOverLane] = useState<FollowUpStatus | null>(null);
+  const dragPreviewRef = useRef<HTMLElement | null>(null);
+
+  const discardDragPreview = () => {
+    dragPreviewRef.current?.remove();
+    dragPreviewRef.current = null;
+  };
 
   useEffect(() => {
     const dismissKanbanToolsOnPointerDown = (event: PointerEvent) => {
@@ -1960,14 +2882,24 @@ function FollowUpQueue({
     return () => {
       document.removeEventListener("pointerdown", dismissKanbanToolsOnPointerDown, true);
       document.removeEventListener("keydown", dismissKanbanToolsOnEscape);
+      dragPreviewRef.current?.remove();
+      dragPreviewRef.current = null;
     };
   }, []);
 
   const boardObjects = useMemo(() => objects.filter((object) => isOnFollowUpBoard(object)), [objects]);
 
   const handleDragStart = (event: DragEvent<HTMLDivElement>, lasairId: string) => {
+    discardDragPreview();
+    const element = event.currentTarget;
+    dragPreviewRef.current = mountKanbanDragPreview(element, event);
     event.dataTransfer.setData("text/lasair-id", lasairId);
     event.dataTransfer.effectAllowed = "move";
+  };
+
+  const handleDragEndCard = () => {
+    discardDragPreview();
+    setDragOverLane(null);
   };
 
   const handleDrop = (event: DragEvent<HTMLElement>, lane: FollowUpStatus) => {
@@ -1985,11 +2917,11 @@ function FollowUpQueue({
     <Section
       id="follow-up-queue"
       eyebrow="Follow-up Queue"
-      title="Kanban-style observing workflow"
-      copy="Set priority (High / Medium / Low), a revisit reminder, and an observing telescope on each card. New telescopes are saved to PostgreSQL. Drag cards between lanes to update workflow status."
+      title="NEEDLE candidates' observing workflow"
+      copy="Set priority (High / Medium / Low / Monitor), a revisit date and time (defaults to one week ahead at 10:00 when you open the reminder with none set), and an observing telescope on each card. New telescopes are saved to PostgreSQL. Drag cards between lanes to update workflow status. Card order within a lane follows priority only after you load or refresh this page; changing priority updates the label without reshuffling."
     >
       <div className="kanban">
-        {lanes.map((lane) => (
+        {lanes.map((lane) => ( 
           <article
             className={`lane${dragOverLane === lane ? " lane--drop-target" : ""}`}
             key={lane}
@@ -2005,17 +2937,18 @@ function FollowUpQueue({
             }}
             onDrop={(event) => handleDrop(event, lane)}
           >
-            <h3>{lane}</h3>
-            {boardObjects
-              .filter((object) => object.followUp === lane)
-              .sort((a, b) => getObjectActionSortTime(b) - getObjectActionSortTime(a))
-              .map((object) => (
+            <h3>{followUpQueueLaneLabel(lane)}</h3>
+            {orderKanbanLaneStable(
+              lane,
+              boardObjects.filter((object) => object.followUp === lane),
+              laneOrderRef,
+            ).map((object) => (
                 <div
                   className="task-card task-card--draggable"
                   key={object.lasairId}
                   draggable
                   onDragStart={(event) => handleDragStart(event, object.lasairId)}
-                  onDragEnd={() => setDragOverLane(null)}
+                  onDragEnd={handleDragEndCard}
                   role="listitem"
                 >
                   <KanbanFollowUpCard

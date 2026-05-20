@@ -2,7 +2,7 @@ INSERT INTO users (id, orcid, email, display_name, role, preferences)
 VALUES
   ('11111111-1111-4111-8111-111111111111', '0000-0002-1825-0097', 'admin@needle-lsst.dev', 'X. Researcher', 'admin', '{"theme":"dark"}'),
   ('22222222-2222-4222-8222-222222222222', '0000-0003-1415-9265', 'arivera@needle-lsst.dev', 'A. Rivera', 'team_lead', '{}'),
-  ('33333333-3333-4333-8333-333333333333', '0000-0001-6180-3398', 'mchen@needle-lsst.dev', 'M. Chen', 'member', '{}')
+  ('33333333-3333-4333-8333-333333333333', '0000-0001-6180-3398', 'mchen@needle-lsst.dev', 'M. Chen', 'member', '{"accountKind":"shared"}')
 ON CONFLICT (id) DO NOTHING;
 
 INSERT INTO objects (lasair_id, object_name, ztf_id, ra, dec, latest_mag, band, tns_class, tns_name, ps_image_urls, last_classified)
@@ -44,6 +44,82 @@ VALUES
   ('LSS_J034402.8-214411', 'NEEDLE 2.0', 'SLSNe-I', 0.91, 0.91, false, ARRAY['faint host','blue color'], '{"SLSNe-I":0.91,"TDE":0.05,"SN II":0.025,"Unclear":0.01,"Other":0.005}', '{"Color evolution":0.88,"Host offset":0.63}', 'Luminous, blue transient offset from faint host. Add to shared SLSN watchlist.', NULL, now() - interval '35 minutes'),
   ('LSS_J145924.2+372142', 'NEEDLE 2.0', 'AGN-removed', 0.96, 0.96, true, ARRAY['WISE AGN','historical variability'], '{"AGN-removed":0.96,"Other":0.02,"Unclear":0.015,"SN Ia":0.005}', '{"Historical variability":0.95}', 'Known variable nucleus removed before transient candidate queueing.', NULL, now() - interval '1 hour'),
   ('LSS_J011449.7+153002', 'NEEDLE 2.0', 'Unclear', 0.52, 0.52, false, ARRAY['low SNR','moon proximity'], '{"Unclear":0.52,"SN II":0.24,"SN Ia":0.15,"TDE":0.06,"Other":0.03}', '{"Signal quality":0.31}', 'Low signal-to-noise stamp; wait for next epoch before escalating.', '33333333-3333-4333-8333-333333333333', now() - interval '2 hours');
+
+-- Earlier NEEDLE epochs for TDE demo object (daily cadence); latest row remains the INSERT above.
+INSERT INTO needle_classifications (
+  lasair_id,
+  model_version,
+  class,
+  score,
+  confidence,
+  agn_removed,
+  quality_flags,
+  raw_probs,
+  feature_importance,
+  comments,
+  classified_by,
+  classified_at
+)
+VALUES
+  (
+    'LSS_J102429.1+091204',
+    'NEEDLE 2.0',
+    'Unclear',
+    0.41,
+    0.41,
+    false,
+    ARRAY['nuclear'],
+    '{"Unclear":0.41,"TDE":0.28,"SN II":0.15,"SN Ia":0.10,"Other":0.06}',
+    '{"Signal quality":0.55}',
+    'Sparse first-night coverage.',
+    NULL,
+    timestamptz '2026-05-10 15:00:00+00'
+  ),
+  (
+    'LSS_J102429.1+091204',
+    'NEEDLE 2.0',
+    'TDE',
+    0.72,
+    0.72,
+    false,
+    ARRAY['nuclear'],
+    '{"TDE":0.72,"Unclear":0.14,"SN Ia":0.08,"SN II":0.04,"Other":0.02}',
+    '{"Color evolution":0.7}',
+    'Rising blue continuum.',
+    NULL,
+    timestamptz '2026-05-11 16:20:00+00'
+  ),
+  (
+    'LSS_J102429.1+091204',
+    'NEEDLE 2.0',
+    'TDE',
+    0.85,
+    0.85,
+    false,
+    ARRAY['nuclear','host matched'],
+    '{"TDE":0.85,"Unclear":0.08,"SN Ia":0.04,"SN II":0.02,"Other":0.01}',
+    '{"Host offset":0.62}',
+    'Host match strengthened.',
+    NULL,
+    timestamptz '2026-05-12 11:00:00+00'
+  ),
+  (
+    'LSS_J102429.1+091204',
+    'NEEDLE 2.0',
+    'TDE',
+    0.91,
+    0.91,
+    false,
+    ARRAY['nuclear','host matched'],
+    '{"TDE":0.91,"SN Ia":0.05,"Unclear":0.03,"Other":0.01}',
+    '{"Rise time":0.71}',
+    'Pre-outburst archival constraint.',
+    NULL,
+    timestamptz '2026-05-13 09:30:00+00'
+  );
+
+-- Multi-band photometry for the TDE demo row is loaded from `demo/mag_sets_v4/ZTF23abaujuy.json`
+-- when you run `node db/init.js` (mag_sets_v4 JSON with `candidates` is supported by the API).
 
 WITH simulated AS (
   SELECT
@@ -135,8 +211,8 @@ FROM simulated;
 INSERT INTO user_object_interactions (user_id, lasair_id, starred, promoted_to_tns, snoozed_until, follow_up_status)
 VALUES
   ('11111111-1111-4111-8111-111111111111', 'LSS_J102429.1+091204', true, false, NULL, 'Observing'),
-  ('11111111-1111-4111-8111-111111111111', 'LSS_J034402.8-214411', true, true, NULL, 'Analyzed'),
-  ('11111111-1111-4111-8111-111111111111', 'LSS_J145924.2+372142', false, false, now() + interval '14 days', 'Archived'),
+  ('11111111-1111-4111-8111-111111111111', 'LSS_J034402.8-214411', true, true, NULL, 'Completed'),
+  ('11111111-1111-4111-8111-111111111111', 'LSS_J145924.2+372142', false, false, now() + interval '14 days', 'Snooze'),
   ('11111111-1111-4111-8111-111111111111', 'LSS_J011449.7+153002', false, false, now() + interval '1 day', 'To Do')
 ON CONFLICT (user_id, lasair_id) DO UPDATE SET
   starred = EXCLUDED.starred,
@@ -151,7 +227,7 @@ WITH simulated AS (
     'LSS_SIM_J' || (100000 + index * 137)::text || '.' || (index % 10)::text || '+' || (1000 + index * 29)::text AS lasair_id,
     CASE
       WHEN index % 6 = 0 THEN 'Observing'
-      WHEN index % 5 = 0 THEN 'Analyzed'
+      WHEN index % 5 = 0 THEN 'Completed'
       ELSE 'To Do'
     END::follow_up_status AS follow_up_status
   FROM generate_series(6, 20) AS index
@@ -177,14 +253,14 @@ INSERT INTO observing_telescopes (code, display_name) VALUES
   ('NTT', 'New Technology Telescope'),
   ('SOAR', 'Southern Astrophysical Research Telescope'),
   ('VLT', 'Very Large Telescope'),
-  ('Gemini_North', 'Gemini North')
+  ('GEMINI_NORTH', 'Gemini North')
 ON CONFLICT (code) DO NOTHING;
 
 INSERT INTO follow_up (lasair_id, priority, telescope, telescope_codes, status, notes, assigned_user, revisit_at)
 VALUES
   (
     'LSS_J102429.1+091204',
-    'High',
+    'Low',
     'LT',
     ARRAY['LT']::text[],
     'Observing',
@@ -192,9 +268,9 @@ VALUES
     '22222222-2222-4222-8222-222222222222',
     now() + interval '18 hours'
   ),
-  ('LSS_J221035.4-011923', 'Medium', 'NTT', ARRAY['NTT']::text[], 'To Do', 'Photometric confirmation.', NULL, NULL),
-  ('LSS_J034402.8-214411', 'High', 'VLT', ARRAY['VLT', 'LT']::text[], 'Analyzed', 'Shared with SLSN Watch.', '33333333-3333-4333-8333-333333333333', NULL),
-  ('LSS_J145924.2+372142', 'Low', NULL, '{}'::text[], 'Archived', 'AGN contaminant.', NULL, NULL),
+  ('LSS_J221035.4-011923', 'Low', 'NTT', ARRAY['NTT']::text[], 'To Do', 'Photometric confirmation.', NULL, NULL),
+  ('LSS_J034402.8-214411', 'Low', 'VLT', ARRAY['VLT', 'LT']::text[], 'Completed', 'Shared with SLSN Watch.', '33333333-3333-4333-8333-333333333333', NULL),
+  ('LSS_J145924.2+372142', 'Low', NULL, '{}'::text[], 'Snooze', 'AGN contaminant.', NULL, NULL),
   ('LSS_J011449.7+153002', 'Low', NULL, '{}'::text[], 'To Do', 'Wait for next epoch.', NULL, NULL);
 
 WITH simulated AS (
@@ -204,7 +280,7 @@ WITH simulated AS (
     round((0.56 + ((index * 7) % 39)::numeric / 100), 5) AS confidence,
     CASE
       WHEN index % 6 = 0 THEN 'Observing'
-      WHEN index % 5 = 0 THEN 'Analyzed'
+      WHEN index % 5 = 0 THEN 'Completed'
       ELSE 'To Do'
     END::follow_up_status AS status
   FROM generate_series(6, 20) AS index
@@ -212,7 +288,7 @@ WITH simulated AS (
 INSERT INTO follow_up (lasair_id, priority, telescope, telescope_codes, status, notes, assigned_user)
 SELECT
   lasair_id,
-  CASE WHEN confidence > 0.82 THEN 'High' WHEN confidence > 0.68 THEN 'Medium' ELSE 'Low' END,
+  'Low',
   NULL,
   '{}'::text[],
   status,
@@ -228,9 +304,9 @@ VALUES
 
 INSERT INTO object_comments (lasair_id, user_id, publisher, body, created_at)
 VALUES
-  ('LSS_J102429.1+091204', '22222222-2222-4222-8222-222222222222', 'A. Rivera', 'Please prioritize spectroscopy while the source is still blue and rising.', now() - interval '3 hours'),
-  ('LSS_J102429.1+091204', '33333333-3333-4333-8333-333333333333', 'M. Chen', 'Host match looks clean; no obvious AGN history in the quick-look checks.', now() - interval '2 hours'),
-  ('LSS_J221035.4-011923', '22222222-2222-4222-8222-222222222222', 'A. Rivera', 'Likely normal Ia; keep in list but no urgent escalation.', now() - interval '4 hours')
+  ('LSS_J102429.1+091204', '22222222-2222-4222-8222-222222222222', 'M. Nicholl', 'Please prioritize spectroscopy while the source is still blue and rising.', now() - interval '3 hours'),
+  ('LSS_J102429.1+091204', '33333333-3333-4333-8333-333333333333', 'X. Sheng', 'Host match looks clean; no obvious AGN history in the quick-look checks.', now() - interval '2 hours'),
+  ('LSS_J221035.4-011923', '22222222-2222-4222-8222-222222222222', 'M. Nicholl', 'Likely normal Ia; keep in list but no urgent escalation.', now() - interval '4 hours')
 ON CONFLICT DO NOTHING;
 
 INSERT INTO audit_log (actor_user_id, action, entity_type, entity_id, metadata)

@@ -8,13 +8,40 @@ export type ObjectClass =
   | "AGN-removed"
   | "Other";
 
-export type FollowUpStatus = "To Do" | "Observing" | "Analyzed" | "Archived";
+export type FollowUpStatus = "To Do" | "Observing" | "Completed" | "Snooze";
 
 export type ObjectComment = {
   id: string;
   publisher: string;
   body: string;
   createdAt: string;
+};
+
+/**
+ * Single photometry point after API normalization.
+ * The database may store flat `{mjd,band,mag}` rows or a mag_sets_v4 blob (`candidates[]` with `magpsf` / `fid`);
+ * the server flattens both to this shape.
+ */
+export type PhotometryPoint = {
+  mjd: number;
+  band: string;
+  mag: number;
+  magErr?: number;
+};
+
+/** Latest NEEDLE classification per UTC day (minimum cadence: 1 day) for history plots. */
+export type DailyClassification = {
+  day: string;
+  classifiedAt: string;
+  class: ObjectClass;
+  confidence: number;
+  rawProbs: Record<string, number>;
+  modelVersion: string;
+};
+
+export type ObjectDetailPayload = {
+  photometry: PhotometryPoint[];
+  classificationHistory: DailyClassification[];
 };
 
 export type TransientObject = {
@@ -30,6 +57,8 @@ export type TransientObject = {
   classification: ObjectClass;
   tnsClass: string | null;
   tnsName: string | null;
+  /** Legacy survey / stamp image URLs (Pan-STARRS cutouts, etc.). */
+  psImageUrls: string[];
   confidence: number;
   classProbabilities: Record<string, number>;
   comment: string;
@@ -38,7 +67,7 @@ export type TransientObject = {
   promoted: boolean;
   snoozed: boolean;
   followUp: FollowUpStatus;
-  priority: "High" | "Medium" | "Low";
+  priority: "High" | "Medium" | "Low" | "Monitor";
   /** ISO 8601 — latest user interaction, follow-up queue touch, or classification time (for sorting). */
   lastActionAt: string;
   /** When to revisit this object (follow-up reminder). */
@@ -85,6 +114,15 @@ export type ObservingTelescope = {
   displayName: string;
 };
 
+/** Session flags from `/api/dashboard` (drives UI affordances). */
+export type PlatformSession = {
+  /**
+   * Private / personal workspace accounts may star objects; shared or institutional accounts see stars but cannot change them.
+   * Server uses `users.preferences->>'accountKind'` (`private` vs `shared`) or `CAN_EDIT_STARRED`.
+   */
+  canEditStarred: boolean;
+};
+
 export type PlatformData = {
   objects: TransientObject[];
   metrics: Metric[];
@@ -93,6 +131,7 @@ export type PlatformData = {
   auditEvents: string[];
   annotations: AnnotationSummary[];
   telescopes: ObservingTelescope[];
+  session?: PlatformSession;
 };
 
 export const fallbackTelescopes: ObservingTelescope[] = [
@@ -100,14 +139,14 @@ export const fallbackTelescopes: ObservingTelescope[] = [
   { code: "NTT", displayName: "New Technology Telescope" },
   { code: "SOAR", displayName: "SOAR Telescope" },
   { code: "VLT", displayName: "Very Large Telescope" },
-  { code: "Gemini_North", displayName: "Gemini North" },
+  { code: "GEMINI_NORTH", displayName: "Gemini North" },
 ];
 
 export const metrics = [
-  { label: "Astronoted objects", value: "1,284", delta: "+12.4%" },
-  { label: "Follow-up objects", value: "86", delta: "+9 today" },
-  { label: "Snoozed objects", value: "213", delta: "-4.1%" },
-  { label: "Classified today", value: "18,542", delta: "312k total" },
+  { label: "Astronoted objects", value: "0", delta: "0%" },
+  { label: "Follow-up objects", value: "10", delta: "+9 today" },
+  { label: "Snoozed objects", value: "21", delta: "-4.1%" },
+  { label: "Classified today", value: "234", delta: "13k total" },
   { label: "Starred objects", value: "437", delta: "129 shared" },
 ];
 
@@ -134,6 +173,7 @@ export const objects: TransientObject[] = [
     classification: "TDE",
     tnsClass: null,
     tnsName: null,
+    psImageUrls: ["/stamps/tde-1842-latest.webp"],
     confidence: 0.94,
     classProbabilities: { TDE: 0.94, "SN Ia": 0.03, "SN II": 0.015, Unclear: 0.015, Other: 0.01 },
     comment: "Host match looks clean; no obvious AGN history in the quick-look checks.",
@@ -155,7 +195,7 @@ export const objects: TransientObject[] = [
     promoted: false,
     snoozed: false,
     followUp: "Observing",
-    priority: "High",
+    priority: "Low",
     lastActionAt: "2026-05-14T14:32:00.000Z",
     revisitAt: "2026-05-15T10:00:00.000Z",
     telescopeCodes: ["LT"],
@@ -177,6 +217,7 @@ export const objects: TransientObject[] = [
     classification: "SN Ia",
     tnsClass: "SN Ia",
     tnsName: "SN 2026abc",
+    psImageUrls: ["/stamps/sn-0419-latest.webp"],
     confidence: 0.87,
     classProbabilities: { "SN Ia": 0.87, "SN II": 0.08, "SN Ibc": 0.03, Unclear: 0.015, Other: 0.005 },
     comment: "Likely normal Ia; keep in list but no urgent escalation.",
@@ -192,7 +233,7 @@ export const objects: TransientObject[] = [
     promoted: false,
     snoozed: false,
     followUp: "To Do",
-    priority: "Medium",
+    priority: "Low",
     lastActionAt: "2026-05-14T14:10:00.000Z",
     revisitAt: null,
     telescopeCodes: [],
@@ -214,6 +255,7 @@ export const objects: TransientObject[] = [
     classification: "SLSNe-I",
     tnsClass: null,
     tnsName: null,
+    psImageUrls: ["/stamps/slsn-0997-latest.webp"],
     confidence: 0.91,
     classProbabilities: { "SLSNe-I": 0.91, TDE: 0.05, "SN II": 0.025, Unclear: 0.01, Other: 0.005 },
     comment: "High SLSN probability driven by blue color evolution and faint host.",
@@ -228,8 +270,8 @@ export const objects: TransientObject[] = [
     starred: true,
     promoted: true,
     snoozed: false,
-    followUp: "Analyzed",
-    priority: "High",
+    followUp: "Completed",
+    priority: "Low",
     lastActionAt: "2026-05-14T13:55:00.000Z",
     revisitAt: null,
     telescopeCodes: ["VLT", "LT"],
@@ -251,6 +293,7 @@ export const objects: TransientObject[] = [
     classification: "AGN-removed",
     tnsClass: "AGN",
     tnsName: "AT 2026agn",
+    psImageUrls: ["/stamps/agn-3301-latest.webp"],
     confidence: 0.96,
     classProbabilities: { "AGN-removed": 0.96, Other: 0.02, Unclear: 0.015, "SN Ia": 0.005 },
     comment: "",
@@ -258,7 +301,7 @@ export const objects: TransientObject[] = [
     starred: false,
     promoted: false,
     snoozed: true,
-    followUp: "Archived",
+    followUp: "Snooze",
     priority: "Low",
     lastActionAt: "2026-05-14T13:40:00.000Z",
     revisitAt: null,
@@ -281,6 +324,7 @@ export const objects: TransientObject[] = [
     classification: "Unclear",
     tnsClass: null,
     tnsName: null,
+    psImageUrls: ["/stamps/unc-7812-latest.webp"],
     confidence: 0.52,
     classProbabilities: { Unclear: 0.52, "SN II": 0.24, "SN Ia": 0.15, TDE: 0.06, Other: 0.03 },
     comment: "",
@@ -306,7 +350,7 @@ const simulatedBands = ["g", "r", "i", "z"];
 for (let index = 6; index <= 20; index += 1) {
   const classification = simulatedClasses[index % simulatedClasses.length];
   const confidence = Number((0.56 + ((index * 7) % 39) / 100).toFixed(2));
-  const followUp: FollowUpStatus = index % 6 === 0 ? "Observing" : index % 5 === 0 ? "Analyzed" : "To Do";
+  const followUp: FollowUpStatus = index % 6 === 0 ? "Observing" : index % 5 === 0 ? "Completed" : "To Do";
 
   objects.push({
     id: `needle-${String(index).padStart(3, "0")}`,
@@ -321,6 +365,7 @@ for (let index = 6; index <= 20; index += 1) {
     classification,
     tnsClass: index % 4 === 0 ? classification : null,
     tnsName: index % 4 === 0 ? `AT 2026sim${String(index).padStart(4, "0")}` : null,
+    psImageUrls: [`/stamps/lsst-2026sim-${String(index).padStart(4, "0")}-latest.webp`],
     confidence,
     classProbabilities: (() => {
       const rest = 1 - confidence;
@@ -346,7 +391,7 @@ for (let index = 6; index <= 20; index += 1) {
     comments: [
       {
         id: `comment-sim-${index}`,
-        publisher: index % 3 === 0 ? "A. Rivera" : "NEEDLE 2.0",
+        publisher: index % 3 === 0 ? "X. Sheng" : "NEEDLE 2.0",
         body: `Simulated comment for ${classification} workflow review.`,
         createdAt: new Date(Date.now() - index * 17 * 60_000).toISOString(),
       },
@@ -355,7 +400,7 @@ for (let index = 6; index <= 20; index += 1) {
     promoted: index % 8 === 0,
     snoozed: index % 10 === 0,
     followUp,
-    priority: confidence > 0.82 ? "High" : confidence > 0.68 ? "Medium" : "Low",
+    priority: "Low",
     lastActionAt: new Date(Date.UTC(2026, 4, 14, 8, 30, index * 97)).toISOString(),
     revisitAt: index % 11 === 0 ? new Date(Date.UTC(2026, 4, 16, 12, 0, index)).toISOString() : null,
     telescopeCodes: index % 7 === 0 ? ["SOAR"] : [],
@@ -397,7 +442,7 @@ export const auditEvents = [
 
 export const annotations: AnnotationSummary[] = [
   {
-    author: "A. Rivera",
+    author: "X. Sheng",
     body: "@TDE Follow-up please review the host offset and spectroscopy window before tomorrow's queue.",
   },
   {
@@ -414,4 +459,5 @@ export const fallbackPlatformData: PlatformData = {
   auditEvents,
   annotations,
   telescopes: fallbackTelescopes,
+  session: { canEditStarred: true },
 };

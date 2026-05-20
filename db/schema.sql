@@ -27,10 +27,25 @@ BEGIN
   END IF;
 
   IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'follow_up_status') THEN
-    CREATE TYPE follow_up_status AS ENUM ('To Do', 'Observing', 'Analyzed', 'Archived');
+    CREATE TYPE follow_up_status AS ENUM ('To Do', 'Observing', 'Completed', 'Snooze');
   END IF;
 END
 $$;
+
+-- Older installs used `Analyzed` instead of `Completed`. Enum labels are fixed after CREATE TYPE runs.
+-- DO $$
+-- BEGIN
+--   IF EXISTS (SELECT 1 FROM pg_type WHERE typname = 'follow_up_status')
+--      AND NOT EXISTS (
+--        SELECT 1
+--        FROM pg_enum e
+--        JOIN pg_type t ON t.oid = e.enumtypid
+--        WHERE t.typname = 'follow_up_status' AND e.enumlabel = 'Completed'
+--      ) THEN
+--     EXECUTE format('ALTER TYPE follow_up_status ADD VALUE %L', 'Completed');
+--   END IF;
+-- END
+-- $$;
 
 CREATE TABLE IF NOT EXISTS users (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -56,6 +71,7 @@ CREATE TABLE IF NOT EXISTS objects (
   tns_class text,
   tns_name text,
   ps_image_urls jsonb NOT NULL DEFAULT '[]'::jsonb,
+  photometry_json jsonb NOT NULL DEFAULT '[]'::jsonb,
   last_classified timestamptz,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
@@ -66,6 +82,9 @@ ALTER TABLE objects
 
 ALTER TABLE objects
   ADD COLUMN IF NOT EXISTS tns_name text;
+
+ALTER TABLE objects
+  ADD COLUMN IF NOT EXISTS photometry_json jsonb NOT NULL DEFAULT '[]'::jsonb;
 
 CREATE INDEX IF NOT EXISTS objects_name_trgm_idx ON objects USING gin (object_name gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS objects_ztf_trgm_idx ON objects USING gin (ztf_id gin_trgm_ops);
@@ -211,7 +230,7 @@ CREATE TABLE IF NOT EXISTS team_collection_objects (
 CREATE TABLE IF NOT EXISTS follow_up (
   id bigserial PRIMARY KEY,
   lasair_id text NOT NULL REFERENCES objects(lasair_id) ON DELETE CASCADE,
-  priority text NOT NULL CHECK (priority IN ('High', 'Medium', 'Low')),
+  priority text NOT NULL DEFAULT 'Low',
   telescope text,
   status follow_up_status NOT NULL DEFAULT 'To Do',
   notes text,
@@ -221,13 +240,50 @@ CREATE TABLE IF NOT EXISTS follow_up (
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 
+DO $$
+DECLARE
+  rec record;
+BEGIN
+  FOR rec IN
+    SELECT c.conname
+    FROM pg_constraint c
+    WHERE c.conrelid = 'public.follow_up'::regclass
+      AND c.contype = 'c'
+      AND pg_get_constraintdef(c.oid) LIKE '%priority%'
+  LOOP
+    EXECUTE format('ALTER TABLE public.follow_up DROP CONSTRAINT %I', rec.conname);
+  END LOOP;
+END $$;
+
+ALTER TABLE follow_up ADD CONSTRAINT follow_up_priority_check CHECK (priority IN ('High', 'Medium', 'Low', 'Monitor'));
+
 CREATE INDEX IF NOT EXISTS follow_up_status_priority_idx ON follow_up (status, priority, updated_at DESC);
+
+ALTER TABLE follow_up ALTER COLUMN priority SET DEFAULT 'Low';
 
 ALTER TABLE follow_up ADD COLUMN IF NOT EXISTS telescope_codes text[] NOT NULL DEFAULT '{}';
 
 UPDATE follow_up
 SET telescope_codes = ARRAY[telescope]
 WHERE telescope IS NOT NULL AND btrim(telescope) <> '' AND cardinality(telescope_codes) = 0;
+
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM pg_enum e
+    JOIN pg_type t ON t.oid = e.enumtypid
+    WHERE t.typname = 'follow_up_status' AND e.enumlabel = 'Completed'
+  ) THEN
+    UPDATE user_object_interactions
+    SET follow_up_status = 'Completed'::follow_up_status
+    WHERE follow_up_status::text = 'Completed';
+    UPDATE follow_up
+    SET status = 'Completed'::follow_up_status
+    WHERE status::text = 'Completed';
+  END IF;
+END
+$$;
 
 CREATE TABLE IF NOT EXISTS observing_telescopes (
   code text PRIMARY KEY CHECK (code ~ '^[A-Za-z0-9._-]{1,32}$'),
@@ -236,6 +292,13 @@ CREATE TABLE IF NOT EXISTS observing_telescopes (
 );
 
 CREATE INDEX IF NOT EXISTS observing_telescopes_code_idx ON observing_telescopes (code);
+
+-- Align legacy mixed-case codes with createTelescope (uppercase) and client tokens.
+UPDATE observing_telescopes SET code = 'GEMINI_NORTH' WHERE code = 'Gemini_North';
+UPDATE follow_up SET telescope = 'GEMINI_NORTH' WHERE telescope = 'Gemini_North';
+UPDATE follow_up
+SET telescope_codes = array_replace(telescope_codes, 'Gemini_North', 'GEMINI_NORTH')
+WHERE telescope_codes @> ARRAY['Gemini_North']::text[];
 
 ALTER TABLE follow_up ADD COLUMN IF NOT EXISTS revisit_at timestamptz;
 
@@ -266,6 +329,7 @@ SELECT DISTINCT ON (o.lasair_id)
   o.tns_class,
   o.tns_name,
   o.ps_image_urls,
+  o.photometry_json,
   c.class,
   c.score,
   c.confidence,

@@ -2,6 +2,7 @@ import {
   fallbackPlatformData,
   type FollowUpStatus,
   type ObjectComment,
+  type ObjectDetailPayload,
   type ObservingTelescope,
   type PlatformData,
   type TransientObject,
@@ -22,12 +23,11 @@ export function normalizeTransientObject(object: TransientObject): TransientObje
     (Array.isArray(fromCamel) ? fromCamel : Array.isArray(fromSnake) ? fromSnake : []);
   let telescopeCodes: string[] = [];
   if (rawList.length > 0) {
-    telescopeCodes = [...new Set(rawList.map((c) => String(c).trim().toUpperCase().replace(/\s+/g, "_")).filter(Boolean))];
+    telescopeCodes = [
+      ...new Set(rawList.map((c) => String(c).trim().replace(/\s+/g, "_")).filter(Boolean)),
+    ];
   } else if (object.telescopeCode ?? row.telescope) {
-    const one = String(object.telescopeCode ?? row.telescope)
-      .trim()
-      .toUpperCase()
-      .replace(/\s+/g, "_");
+    const one = String(object.telescopeCode ?? row.telescope).trim().replace(/\s+/g, "_");
     if (one) {
       telescopeCodes = [one];
     }
@@ -57,6 +57,9 @@ export async function fetchPlatformData(): Promise<{ data: PlatformData; source:
     const data: PlatformData = {
       ...payload,
       objects: payload.objects.map(normalizeTransientObject),
+      session: {
+        canEditStarred: payload.session?.canEditStarred ?? fallbackPlatformData.session?.canEditStarred ?? true,
+      },
     };
     return { data: { ...fallbackPlatformData, ...data }, source: "database" };
   } catch (error) {
@@ -65,12 +68,26 @@ export async function fetchPlatformData(): Promise<{ data: PlatformData; source:
   }
 }
 
+/**
+ * Loads per-object photometry and daily classification history for the detail page.
+ */
+export async function fetchObjectDetail(lasairId: string): Promise<ObjectDetailPayload> {
+  const response = await fetch(`/api/objects/${encodeURIComponent(lasairId)}/detail`);
+
+  if (!response.ok) {
+    const error = (await response.json().catch(() => null)) as { detail?: string; error?: string } | null;
+    throw new Error(error?.detail ?? error?.error ?? `Object detail API returned ${response.status}`);
+  }
+
+  return response.json() as Promise<ObjectDetailPayload>;
+}
+
 export type ObjectInteractionUpdate = {
   starred?: boolean;
   promoted?: boolean;
   snoozed?: boolean;
   followUp?: FollowUpStatus;
-  priority?: "High" | "Medium" | "Low";
+  priority?: "High" | "Medium" | "Low" | "Monitor";
   revisitAt?: string | null;
   telescope?: string | null;
   telescopeCodes?: string[];

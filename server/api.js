@@ -42,6 +42,37 @@ function normalizeTelescopeCodeToken(value) {
   return s || null;
 }
 
+/**
+ * Maps normalized facility tokens to the exact `observing_telescopes.code` values stored in PostgreSQL.
+ * Matching is case-insensitive so e.g. GEMINI_NORTH resolves to the row stored as GEMINI_NORTH or Gemini_North.
+ */
+async function resolveTelescopeCodesForStore(tokens) {
+  const normalized = [...new Set(tokens.map((c) => normalizeTelescopeCodeToken(c)).filter(Boolean))];
+  if (normalized.length === 0) {
+    return [];
+  }
+  const resolved = [];
+  for (const code of normalized) {
+    const result = await query(`SELECT code FROM observing_telescopes WHERE lower(code) = lower($1) LIMIT 1`, [code]);
+    if (result.rowCount === 0) {
+      const error = new Error(`Unknown telescope "${code}". Add it in the telescope menu first.`);
+      error.statusCode = 400;
+      throw error;
+    }
+    resolved.push(result.rows[0].code);
+  }
+  const seen = new Set();
+  const out = [];
+  for (const c of resolved) {
+    if (seen.has(c)) {
+      continue;
+    }
+    seen.add(c);
+    out.push(c);
+  }
+  return out;
+}
+
 function coercePostgresTextArray(value) {
   if (value == null || value === "") {
     return [];
@@ -65,29 +96,132 @@ function coercePostgresTextArray(value) {
   return [];
 }
 
+function coercePsImageUrls(value) {
+  if (value == null) {
+    return [];
+  }
+  if (Array.isArray(value)) {
+    return value.map((x) => String(x)).filter(Boolean);
+  }
+  return [];
+}
+
+/** ZTF `fid` → filter name (Lasair / ZTF). */
+function ztfFidToBand(fid) {
+  const n = Number(fid);
+  const map = { 1: "g", 2: "r", 3: "i" };
+  if (map[n]) {
+    return map[n];
+  }
+  return Number.isFinite(n) ? `fid${n}` : "";
+}
+
+/**
+ * NEEDLE `mag_sets_v4` export: `{ objectId, objectData?, candidates: [{ mjd, magpsf, sigmapsf, fid, ... }] }`.
+ * Candidates are flattened to `{ mjd, band, mag, magErr }` for the light-curve API.
+ */
+function photometryFromMagSetsV4(raw) {
+  if (!raw || typeof raw !== "object" || !Array.isArray(raw.candidates)) {
+    return null;
+  }
+  const out = [];
+  for (const c of raw.candidates) {
+    const mjd = Number(c.mjd);
+    const mag = Number(c.magpsf);
+    const band = ztfFidToBand(c.fid);
+    if (!Number.isFinite(mjd) || !Number.isFinite(mag) || !band) {
+      continue;
+    }
+    const magErrRaw = c.sigmapsf != null ? Number(c.sigmapsf) : undefined;
+    const magErr = magErrRaw != null && Number.isFinite(magErrRaw) ? magErrRaw : undefined;
+    out.push({ mjd, band, mag, magErr });
+  }
+  return out.length > 0 ? out : null;
+}
+
+/**
+ * Normalizes stored photometry JSON: mag_sets_v4 object, flat array, or `{ points: [...] }`.
+ */
+function normalizePhotometryJson(raw) {
+  const fromMagSets = photometryFromMagSetsV4(raw);
+  if (fromMagSets) {
+    return fromMagSets;
+  }
+  const list = Array.isArray(raw) ? raw : raw && typeof raw === "object" && Array.isArray(raw.points) ? raw.points : [];
+  return list
+    .map((p) => ({
+      mjd: Number(p.mjd),
+      band: String(p.band ?? ""),
+      mag: Number(p.mag),
+      magErr: p.magErr != null ? Number(p.magErr) : undefined,
+    }))
+    .filter((p) => Number.isFinite(p.mjd) && p.band && Number.isFinite(p.mag));
+}
+
+async function getObjectDetail(lasairId) {
+  const objResult = await query(`SELECT lasair_id, photometry_json FROM objects WHERE lasair_id = $1`, [lasairId]);
+  if (objResult.rowCount === 0) {
+    return null;
+  }
+  const photometry = normalizePhotometryJson(objResult.rows[0].photometry_json);
+
+  const histResult = await query(
+    `
+    SELECT DISTINCT ON ((classified_at AT TIME ZONE 'UTC')::date)
+      (classified_at AT TIME ZONE 'UTC')::date AS day,
+      classified_at,
+      class::text AS class,
+      confidence,
+      raw_probs,
+      model_version
+    FROM needle_classifications
+    WHERE lasair_id = $1
+    ORDER BY (classified_at AT TIME ZONE 'UTC')::date ASC, classified_at DESC
+    `,
+    [lasairId],
+  );
+
+  const classificationHistory = histResult.rows.map((row) => {
+    const day =
+      row.day instanceof Date ? row.day.toISOString().slice(0, 10) : String(row.day).slice(0, 10);
+    const ts = row.classified_at instanceof Date ? row.classified_at : new Date(row.classified_at);
+    return {
+      day,
+      classifiedAt: ts.toISOString(),
+      class: row.class,
+      confidence: Number(row.confidence),
+      rawProbs:
+        row.raw_probs && typeof row.raw_probs === "object" && !Array.isArray(row.raw_probs)
+          ? row.raw_probs
+          : {},
+      modelVersion: row.model_version ?? "",
+    };
+  });
+
+  return { photometry, classificationHistory };
+}
+
 function telescopeCodesFromRow(row) {
   const raw = coercePostgresTextArray(row?.telescope_codes);
   let codes = [];
   if (raw.length > 0) {
-    codes = raw.map((c) => normalizeTelescopeCodeToken(c)).filter(Boolean);
+    codes = raw.map((c) => String(c).trim()).filter(Boolean);
   } else if (row?.telescope) {
-    const one = normalizeTelescopeCodeToken(row.telescope);
+    const one = String(row.telescope).trim();
     if (one) {
       codes = [one];
     }
   }
-  return [...new Set(codes)];
-}
-
-async function validateTelescopeCodes(codes) {
-  for (const code of codes) {
-    const tel = await query(`SELECT 1 FROM observing_telescopes WHERE code = $1`, [code]);
-    if (tel.rowCount === 0) {
-      const error = new Error(`Unknown telescope "${code}". Add it in the telescope menu first.`);
-      error.statusCode = 400;
-      throw error;
+  const seen = new Set();
+  const out = [];
+  for (const c of codes) {
+    if (seen.has(c)) {
+      continue;
     }
+    seen.add(c);
+    out.push(c);
   }
+  return out;
 }
 
 /**
@@ -121,6 +255,7 @@ function mapObject(row) {
     classification: row.class ?? "Unclear",
     tnsClass: row.tns_class ?? null,
     tnsName: row.tns_name ?? null,
+    psImageUrls: coercePsImageUrls(row.ps_image_urls),
     confidence: Number(row.confidence ?? 0),
     classProbabilities:
       row.raw_probs && typeof row.raw_probs === "object" && !Array.isArray(row.raw_probs) ? row.raw_probs : {},
@@ -129,8 +264,8 @@ function mapObject(row) {
     starred: Boolean(row.starred),
     promoted: Boolean(row.promoted_to_tns),
     snoozed: Boolean(row.snoozed_until),
-    followUp: row.follow_up_status ?? row.follow_up_status_from_queue ?? "To Do",
-    priority: row.priority ?? "Medium",
+    followUp: mapFollowUpForClient(row.follow_up_status ?? row.follow_up_status_from_queue ?? "To Do"),
+    priority: mapPriorityForClient(row.priority),
     lastActionAt: row.last_action_at
       ? row.last_action_at instanceof Date
         ? row.last_action_at.toISOString()
@@ -344,6 +479,62 @@ async function createTelescope(body) {
   };
 }
 
+/** Values allowed by Postgres enum `follow_up_status`. */
+const CANONICAL_FOLLOW_UP = new Set(["To Do", "Observing", "Completed", "Snooze"]);
+
+/**
+ * Normalizes PATCH input: trims strings, drops null/empty, maps legacy labels.
+ */
+function normalizeFollowUpStatusForApi(value) {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  const s = String(value).trim();
+  if (s === "" || s.toLowerCase() === "null") {
+    return undefined;
+  }
+  if (s === "Analyzed") {
+    return "Completed";
+  }
+  if (s === "Archived") {
+    return "Snooze";
+  }
+  if (s === "Completed") {
+    return "Completed";
+  }
+  return s;
+}
+
+/** Maps DB row values to the labels the SPA expects (handles legacy `Analyzed`, `Archived`). */
+function mapFollowUpForClient(raw) {
+  const n = normalizeFollowUpStatusForApi(raw);
+  if (n !== undefined && CANONICAL_FOLLOW_UP.has(n)) {
+    return n;
+  }
+  const fallback = raw == null ? "" : String(raw).trim();
+  if (fallback === "Completed") {
+    return "Completed";
+  }
+  if (fallback === "Analyzed") {
+    return "Completed";
+  }
+  if (fallback === "Archived") {
+    return "Snooze";
+  }
+  return "To Do";
+}
+
+function mapPriorityForClient(raw) {
+  const p = raw == null || raw === "" ? "Low" : String(raw);
+  if (p === "Snoozed") {
+    return "Monitor";
+  }
+  if (["High", "Medium", "Low", "Monitor"].includes(p)) {
+    return p;
+  }
+  return "Low";
+}
+
 async function syncFollowUpRow(lasairId, update) {
   const needsSync =
     update.followUp !== undefined ||
@@ -356,8 +547,8 @@ async function syncFollowUpRow(lasairId, update) {
     return;
   }
 
-  if (update.priority !== undefined && !["High", "Medium", "Low"].includes(update.priority)) {
-    const error = new Error("Invalid priority (use High, Medium, or Low).");
+  if (update.priority !== undefined && !["High", "Medium", "Low", "Monitor"].includes(update.priority)) {
+    const error = new Error("Invalid priority (use High, Medium, Low, or Monitor).");
     error.statusCode = 400;
     throw error;
   }
@@ -390,10 +581,12 @@ async function syncFollowUpRow(lasairId, update) {
   let priority;
   if (update.priority !== undefined) {
     priority = update.priority;
+  } else if (update.followUp === "Completed") {
+    priority = "Low";
   } else if (prev) {
     priority = prev.priority;
   } else {
-    priority = status === "Observing" ? "High" : "Medium";
+    priority = "Low";
   }
 
   let telescopeCodes = telescopeCodesFromRow(prev ?? {});
@@ -403,12 +596,7 @@ async function syncFollowUpRow(lasairId, update) {
       error.statusCode = 400;
       throw error;
     }
-    telescopeCodes = [
-      ...new Set(
-        update.telescopeCodes.map((c) => normalizeTelescopeCodeToken(c)).filter(Boolean),
-      ),
-    ];
-    await validateTelescopeCodes(telescopeCodes);
+    telescopeCodes = await resolveTelescopeCodesForStore(update.telescopeCodes);
   } else if (update.telescope !== undefined) {
     if (update.telescope === null || update.telescope === "") {
       telescopeCodes = [];
@@ -417,8 +605,7 @@ async function syncFollowUpRow(lasairId, update) {
       if (!one) {
         telescopeCodes = [];
       } else {
-        await validateTelescopeCodes([one]);
-        telescopeCodes = [one];
+        telescopeCodes = await resolveTelescopeCodesForStore([one]);
       }
     }
   }
@@ -472,10 +659,27 @@ async function syncFollowUpRow(lasairId, update) {
  * Snooze is stored for 3 months; expired snoozed objects can be purged by `purge_expired_snoozed_objects()`.
  */
 async function updateObjectInteraction(lasairId, update) {
-  const allowedFollowUpStatuses = new Set(["To Do", "Observing", "Analyzed", "Archived"]);
+  if (update.starred !== undefined) {
+    const flags = await getSessionFlags();
+    if (!flags.canEditStarred) {
+      const error = new Error("Starred is only editable for private workspace accounts.");
+      error.statusCode = 403;
+      throw error;
+    }
+  }
+
+  if (update.followUp !== undefined) {
+    const normalized = normalizeFollowUpStatusForApi(update.followUp);
+    if (normalized === undefined) {
+      delete update.followUp;
+    } else {
+      update.followUp = normalized;
+    }
+  }
+
   const followUp = update.followUp;
 
-  if (followUp !== undefined && !allowedFollowUpStatuses.has(followUp)) {
+  if (followUp !== undefined && !CANONICAL_FOLLOW_UP.has(followUp)) {
     const error = new Error("Invalid follow-up status.");
     error.statusCode = 400;
     throw error;
@@ -601,12 +805,36 @@ async function createObjectComment(lasairId, body) {
 }
 
 /**
+ * Whether the current demo user may change `starred` on objects (private accounts only).
+ * Override with env CAN_EDIT_STARRED=true|false. Otherwise uses users.preferences accountKind: private | shared.
+ */
+async function getSessionFlags() {
+  const fromEnv = process.env.CAN_EDIT_STARRED;
+  if (fromEnv !== undefined && String(fromEnv).trim() !== "") {
+    const v = String(fromEnv).toLowerCase();
+    return { canEditStarred: v === "1" || v === "true" || v === "yes" };
+  }
+
+  const result = await query(
+    `
+      SELECT COALESCE(preferences->>'accountKind', preferences->>'account_kind', 'private') AS kind
+      FROM users
+      WHERE id = $1
+    `,
+    [demoUserId],
+  );
+  const kind = String(result.rows[0]?.kind ?? "private").toLowerCase();
+  return { canEditStarred: kind === "private" };
+}
+
+/**
  * Builds the frontend dashboard payload from multiple database queries.
  * To add data to the homepage manually, add another query here and include its result in the returned object.
  */
 async function getDashboard() {
-  const [objects, metricsResult, histogramResult, auditResult, teamsResult, annotationsResult, telescopesResult] =
+  const [session, objects, metricsResult, histogramResult, auditResult, teamsResult, annotationsResult, telescopesResult] =
     await Promise.all([
+      getSessionFlags(),
       getObjects(new URLSearchParams([["limit", "100"]])),
     query(
       `
@@ -615,7 +843,7 @@ async function getDashboard() {
           COUNT(*) FILTER (WHERE c.classified_at >= now() - interval '24 hours')::int AS classified_today,
           COUNT(*) FILTER (WHERE i.starred)::int AS starred,
           COUNT(*) FILTER (WHERE i.snoozed_until > now())::int AS snoozed,
-          COUNT(*) FILTER (WHERE f.status IS NOT NULL AND f.status <> 'Archived')::int AS follow_up
+          COUNT(*) FILTER (WHERE f.status IS NOT NULL AND f.status <> 'Snooze')::int AS follow_up
         FROM latest_object_classifications c
         LEFT JOIN user_object_interactions i ON i.lasair_id = c.lasair_id AND i.user_id = $1
         LEFT JOIN follow_up f ON f.lasair_id = c.lasair_id
@@ -679,9 +907,10 @@ async function getDashboard() {
   const summary = metricsResult.rows[0];
 
   return {
+    session,
     objects,
     metrics: [
-      { label: "Astronoted objects", value: String(summary.classified_total), delta: "from database" },
+      { label: "Promoted objects", value: String(summary.classified_total), delta: "from database" },
       { label: "Follow-up objects", value: String(summary.follow_up), delta: "active queue" },
       { label: "Snoozed objects", value: String(summary.snoozed), delta: "currently snoozed" },
       { label: "Classified today", value: String(summary.classified_today), delta: `${summary.classified_total} total` },
@@ -745,6 +974,18 @@ async function handleRequest(request, response) {
       const lasairId = decodeURIComponent(commentMatch[1]);
       const body = await readJsonBody(request);
       sendJson(response, 201, await createObjectComment(lasairId, body.body));
+      return;
+    }
+
+    const detailMatch = url.pathname.match(/^\/api\/objects\/(.+)\/detail$/);
+    if (request.method === "GET" && detailMatch) {
+      const lasairId = decodeURIComponent(detailMatch[1]);
+      const detail = await getObjectDetail(lasairId);
+      if (!detail) {
+        sendJson(response, 404, { error: "Object not found" });
+        return;
+      }
+      sendJson(response, 200, detail);
       return;
     }
 
