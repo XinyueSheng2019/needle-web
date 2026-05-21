@@ -4,7 +4,9 @@ import {
   type ObjectComment,
   type ObjectDetailPayload,
   type ObservingTelescope,
+  type PhotometryPoint,
   type PlatformData,
+  type SurveyId,
   type TransientObject,
 } from "./data";
 
@@ -81,6 +83,31 @@ export async function fetchObjectDetail(lasairId: string): Promise<ObjectDetailP
 
   return response.json() as Promise<ObjectDetailPayload>;
 }
+
+const SURVEY_IDS: SurveyId[] = ["LSST", "ZTF", "ATLAS"];
+
+function parseSurveyId(value: string | null): SurveyId {
+  const token = (value ?? "LSST").toUpperCase();
+  return SURVEY_IDS.includes(token as SurveyId) ? (token as SurveyId) : "LSST";
+}
+
+/**
+ * Loads survey-specific photometry (ZTF, LSST, ATLAS) for the light-curve plot.
+ */
+export async function fetchSurveyPhotometry(lasairId: string, survey: SurveyId): Promise<PhotometryPoint[]> {
+  const params = new URLSearchParams({ survey });
+  const response = await fetch(`/api/objects/${encodeURIComponent(lasairId)}/photometry?${params}`);
+
+  if (!response.ok) {
+    const error = (await response.json().catch(() => null)) as { detail?: string; error?: string } | null;
+    throw new Error(error?.detail ?? error?.error ?? `Survey photometry API returned ${response.status}`);
+  }
+
+  const payload = (await response.json()) as { survey?: string; points?: PhotometryPoint[] };
+  return Array.isArray(payload.points) ? payload.points : [];
+}
+
+export { parseSurveyId };
 
 export type ObjectInteractionUpdate = {
   starred?: boolean;

@@ -646,9 +646,11 @@ h3 {
 .section-grid,
 .detail-grid,
 .model-grid,
-.admin-grid {
+.admin-grid,
+.reclassify-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
 }
 
 .detail-tag-row {
@@ -895,6 +897,17 @@ h3 {
   font-weight: 600;
 }
 
+.detail-coords-grid dd a {
+  font-weight: 500;
+  color: #67e8f9;
+  word-break: break-all;
+  text-decoration: none;
+}
+
+.detail-coords-grid dd a:hover {
+  text-decoration: underline;
+}
+
 .detail-prob-block {
   margin-bottom: 1rem;
 }
@@ -902,6 +915,9 @@ h3 {
 .detail-prob-block--below-curve {
   margin-top: 0.35rem;
   margin-bottom: 0;
+  display: flex;
+  flex-direction:column;
+  /* align-items: flex-end; */
 }
 
 .detail-subheading {
@@ -980,6 +996,12 @@ h3 {
 .lightcurve-chart-wrap {
   margin: 0.5rem 0 1.25rem;
   position: relative;
+}
+
+.lightcurve-loading-hint {
+  margin: 0 0 0.35rem;
+  font-size: 0.76rem;
+  color: #94a3b8;
 }
 
 .lightcurve-hit {
@@ -1066,6 +1088,23 @@ h3 {
   background: rgba(2, 6, 23, 0.52);
 }
 
+.lightcurve-svg--stacked {
+  margin-bottom: 0.35rem;
+}
+
+.lightcurve-legend--needle {
+  margin-top: 0.35rem;
+  padding-top: 0.35rem;
+  border-top: 1px solid rgba(148, 163, 184, 0.12);
+}
+
+.needle-class-line {
+  width: 1rem;
+  height: 0.18rem;
+  border-radius: 999px;
+  flex-shrink: 0;
+}
+
 .chart-axis-title {
   letter-spacing: 0.02em;
 }
@@ -1084,7 +1123,44 @@ h3 {
 .lightcurve-legend li {
   display: flex;
   align-items: center;
+  gap: 0.4rem;
+}
+
+.lightcurve-survey-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 0.65rem 0 0.35rem;
+}
+
+.lightcurve-survey-tabs button {
+  min-width: 4.5rem;
+  padding: 0.35rem 0.75rem;
+  font-size: 0.78rem;
+}
+
+.lightcurve-survey-key {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.85rem;
+  list-style: none;
+  margin: 0.45rem 0 0.35rem;
+  padding: 0;
+  font-size: 0.76rem;
+  color: #94a3b8;
+}
+
+.lightcurve-survey-key li {
+  display: flex;
+  align-items: center;
   gap: 0.35rem;
+}
+
+.legend-symbol {
+  width: 0.85rem;
+  height: 0.85rem;
+  flex-shrink: 0;
+  display: block;
 }
 
 .legend-swatch {
@@ -1729,7 +1805,105 @@ td:nth-child(9) {
 }
 
 .floating-action {
-  justify-self: end;
+  display: inline-block;
+  margin-top: 0.75rem;
+  border: 1px solid rgba(103, 232, 249, 0.35);
+  border-radius: 999px;
+  padding: 0.72rem 1rem;
+  color: #06111f;
+  background: linear-gradient(135deg, #67e8f9, #38bdf8);
+  cursor: pointer;
+  font-weight: 800;
+  text-decoration: none;
+  text-align: center;
+}
+
+.floating-action:hover {
+  transform: translateY(-1px);
+}
+
+.reclassify-back {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem 1.25rem;
+  margin: 0.5rem 0 0;
+}
+
+.reclassify-summary {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem 1rem;
+  margin: 0 0 1rem;
+}
+
+.reclassify-summary dt {
+  margin: 0;
+  font-size: 0.75rem;
+  color: #94a3b8;
+}
+
+.reclassify-summary dd {
+  margin: 0.15rem 0 0;
+  font-weight: 600;
+}
+
+.reclassify-checklist {
+  margin: 0 0 1rem;
+  padding-left: 1.1rem;
+  color: #cbd5e1;
+}
+
+.reclassify-placeholder {
+  display: grid;
+  place-items: center;
+  min-height: 10rem;
+  margin: 0.75rem 0;
+  border-radius: 0.75rem;
+  border: 1px dashed rgba(148, 163, 184, 0.35);
+  background: rgba(2, 6, 23, 0.45);
+  color: #64748b;
+  font-size: 0.85rem;
+}
+
+.reclassify-panel--wide {
+  grid-column: 1 / -1;
+}
+
+.reclassify-feature-list {
+  margin: 0.75rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.reclassify-feature-list li {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.45rem 0;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+  color: #e2e8f0;
+}
+
+.reclassify-feature-list--placeholder span:last-child {
+  color: #64748b;
+}
+
+.reclassify-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem 1rem;
+  margin-top: 1.25rem;
+}
+
+.reclassify-cancel {
+  color: #94a3b8;
+  font-size: 0.9rem;
+}
+
+.reclassify-cancel:hover {
+  color: #e2e8f0;
 }
 
 .collection-card {
@@ -2318,6 +2492,7 @@ textarea {
   .detail-grid,
   .model-grid,
   .admin-grid,
+  .reclassify-grid,
   .browser-layout,
   .cards-three,
   .stamp-row,

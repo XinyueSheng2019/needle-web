@@ -22,11 +22,15 @@ export type ObjectComment = {
  * The database may store flat `{mjd,band,mag}` rows or a mag_sets_v4 blob (`candidates[]` with `magpsf` / `fid`);
  * the server flattens both to this shape.
  */
+export type SurveyId = "ZTF" | "LSST" | "ATLAS";
+
 export type PhotometryPoint = {
   mjd: number;
   band: string;
   mag: number;
   magErr?: number;
+  flux?: number;
+  fluxErr?: number;
 };
 
 /** Latest NEEDLE classification per UTC day (minimum cadence: 1 day) for history plots. */

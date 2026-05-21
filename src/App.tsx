@@ -8,6 +8,7 @@ import {
   type ObservingTelescope,
   type PhotometryPoint,
   type PlatformData,
+  type SurveyId,
   type TransientObject,
 } from "./data";
 import {
@@ -32,6 +33,7 @@ import {
   updateObjectInteraction,
   type ObjectInteractionUpdate,
 } from "./api";
+import { ReclassifyPage } from "./reclassify";
 import { TelescopeVisibilityPanel } from "./TelescopeVisibilityPanel";
 
 const navigation = [
@@ -40,13 +42,28 @@ const navigation = [
   { label: "Follow-ups", id: "follow-up-queue" },
 ] as const;
 
-type PageId = (typeof navigation)[number]["id"] | "object-detail" | "admin";
+type PageId = (typeof navigation)[number]["id"] | "object-detail" | "reclassify" | "admin";
 
-const pageIds: PageId[] = [...navigation.map((item) => item.id), "object-detail", "admin"];
+const pageIds: PageId[] = [...navigation.map((item) => item.id), "object-detail", "reclassify", "admin"];
 
+/** Lasair-ZTF browser URL for one object (`lasair_id` path segment matches Object List Lasair links). */
+function lasairZtfObjectPageUrl(lasairId: string): string {
+  return `https://lasair-ztf.lsst.ac.uk/objects/${lasairId}`;
+}
+
+function finkObjectPageUrl(lasairId: string): string {
+  return `https://ztf.fink-portal.org/${lasairId}`;
+}
+function alerceObjectPageUrl(lasairId: string): string {
+  return `https://alerce.online/object/${lasairId}`;
+}
+
+function tnsObjectPageUrl(ra: string, dec: string): string {
+  return `https://www.tns-project.org/object?ra=${ra}&dec=${dec}`;
+}
 /**
- * Parses `#page` and optional `?lasairId=` for object detail deep links.
- * Object List links use `#object-detail?lasairId=<id>` so the detail page loads that row’s comments.
+ * Parses `#page` and optional `?lasairId=` for object-scoped deep links.
+ * Object List links use `#object-detail?lasairId=<id>`; re-classify uses `#reclassify?lasairId=<id>`.
  */
 function parseLocationHash(): { page: PageId; detailLasairId: string | null } {
   const raw = window.location.hash.replace(/^#/, "");
@@ -74,6 +91,29 @@ const classColor: Record<ObjectClass, string> = {
   "AGN-removed": "red",
   Other: "blue",
 };
+
+/** Stroke colours for daily NEEDLE score lines (match badge tones). */
+const NEEDLE_CLASS_STROKE: Record<ObjectClass, string> = {
+  TDE: "#2dd4bf",
+  "SLSNe-I": "#a78bfa",
+  "SN Ia": "#fbbf24",
+  "SN Ibc": "#fb923c",
+  "SN II": "#fb7185",
+  Unclear: "#94a3b8",
+  "AGN-removed": "#f87171",
+  Other: "#60a5fa",
+};
+
+const NEEDLE_SCORE_CLASSES: ObjectClass[] = [
+  "TDE",
+  "SLSNe-I",
+  "SN Ia",
+  "SN Ibc",
+  "SN II",
+  "Unclear",
+  "AGN-removed",
+  "Other",
+];
 
 type InteractionHandler = (object: TransientObject, update: ObjectInteractionUpdate) => void;
 type CommentPostHandler = (object: TransientObject, body: string) => Promise<ObjectComment>;
@@ -286,15 +326,203 @@ function formatLastClassified(lastClassified: string) {
 /** `<select>` value: open the inline form for a new facility (added with "Add to card"). */
 const KANBAN_ADD_TELESCOPE_SELECT_VALUE = "__kanban_add_telescope__";
 
+/** SDSS-style band colours — shared across surveys; survey identity is the marker shape. */
 const LC_BAND_COLORS: Record<string, string> = {
-  g: "#4ade80",
-  r: "#f87171",
-  i: "#fb923c",
-  z: "#c084fc",
-  u: "#38bdf8",
-  y: "#fbbf24",
-  default: "#94a3b8",
+  u: "#668fcc",
+  g: "#59a86e",
+  r: "#c25555",
+  i: "#b8875a",
+  z: "#9a74c9",
+  y: "#c9a227",
+  c: "#4da3b8",
+  o: "#d2844a",
+  default: "#8b9cb3",
 };
+
+const SURVEY_SYMBOLS: Record<SurveyId, { label: string; dash?: string }> = {
+  LSST: { label: "circle" },
+  ZTF: { label: "square", dash: "4 2" },
+  ATLAS: { label: "triangle", dash: "2 2" },
+};
+
+function LightCurveSurveySymbol({
+  survey,
+  x,
+  y,
+  size,
+  fill,
+  className,
+}: {
+  survey: SurveyId;
+  x: number;
+  y: number;
+  size: number;
+  fill: string;
+  className?: string;
+}) {
+  const stroke = "rgba(2, 6, 23, 0.78)";
+
+  if (survey === "ZTF") {
+    return (
+      <rect
+        x={x - size}
+        y={y - size}
+        width={size * 2}
+        height={size * 2}
+        rx={0.75}
+        fill={fill}
+        stroke={stroke}
+        strokeWidth={0.9}
+        className={className}
+      />
+    );
+  }
+
+  if (survey === "ATLAS") {
+    return (
+      <polygon
+        points={`${x},${y - size * 1.12} ${x - size},${y + size * 0.82} ${x + size},${y + size * 0.82}`}
+        fill={fill}
+        stroke={stroke}
+        strokeWidth={0.9}
+        className={className}
+      />
+    );
+  }
+
+  return (
+    <circle
+      cx={x}
+      cy={y}
+      r={size}
+      fill={fill}
+      stroke={stroke}
+      strokeWidth={0.9}
+      className={className}
+    />
+  );
+}
+
+function LightCurveLegendSymbol({ survey, fill }: { survey: SurveyId; fill: string }) {
+  return (
+    <svg className="legend-symbol" viewBox="0 0 16 16" aria-hidden="true">
+      <LightCurveSurveySymbol survey={survey} x={8} y={8} size={4.5} fill={fill} />
+    </svg>
+  );
+}
+
+function magToFlux(mag: number): number {
+  return 10 ** (-0.4 * mag);
+}
+
+function fluxToMag(flux: number): number {
+  return -2.5 * Math.log10(flux);
+}
+
+function attachFluxToPoint(point: PhotometryPoint): PhotometryPoint {
+  const flux = point.flux ?? magToFlux(point.mag);
+  const fluxErr =
+    point.fluxErr ??
+    (point.magErr != null && Number.isFinite(point.magErr)
+      ? flux * (Math.LN10 / 2.5) * point.magErr
+      : undefined);
+  return { ...point, flux, fluxErr };
+}
+
+function surveyLightCurveProfile(basePoints: PhotometryPoint[]) {
+  const mags = basePoints.map((p) => p.mag).filter(Number.isFinite);
+  const mjds = basePoints.map((p) => p.mjd).filter(Number.isFinite);
+  const refMag = mags.length ? mags.reduce((acc, value) => acc + value, 0) / mags.length : 20;
+  const minMjd = mjds.length ? Math.min(...mjds) : 60775;
+  const maxMjd = mjds.length ? Math.max(...mjds) : minMjd + 12;
+  const span = Math.max(maxMjd - minMjd, 6);
+  return { refMag, minMjd, span };
+}
+
+/** Survey-native detections: distinct cadence, bands, and epochs per survey. */
+function generateSurveyDetections(
+  basePoints: PhotometryPoint[],
+  survey: SurveyId,
+  objectKey = "object",
+): PhotometryPoint[] {
+  const normalized = basePoints.map(attachFluxToPoint);
+
+  if (survey === "ZTF") {
+    return normalized.sort((a, b) => a.mjd - b.mjd);
+  }
+
+  const { refMag, minMjd, span } = surveyLightCurveProfile(normalized);
+  const out: PhotometryPoint[] = [];
+
+  if (survey === "LSST") {
+    const bands = ["u", "g", "r", "i", "z", "y"] as const;
+    const bandOffset: Record<(typeof bands)[number], number> = {
+      u: -0.24,
+      g: 0,
+      r: 0.05,
+      i: 0.11,
+      z: 0.2,
+      y: 0.28,
+    };
+    const cadence = 1.15;
+    const epochStart = 0.35;
+    const epochs = Math.min(6, Math.max(4, Math.ceil(span / cadence)));
+    for (let epoch = 0; epoch < epochs; epoch += 1) {
+      const t = epochStart + epoch * cadence;
+      for (const band of bands) {
+        const mjd =
+          minMjd +
+          t +
+          (band === "u" ? 0.06 : band === "z" ? 0.1 : band === "y" ? 0.14 : 0);
+        const fade = epoch * 0.09;
+        const jitter = (detHashU01(`${objectKey}|LSST|${epoch}|${band}`) - 0.5) * 0.14;
+        const mag = refMag - fade + bandOffset[band] + jitter;
+        const magErr = 0.025 + detHashU01(`${objectKey}|LSST|err|${epoch}|${band}`) * 0.05;
+        out.push(attachFluxToPoint({ mjd, band, mag, magErr }));
+      }
+    }
+    return out.sort((a, b) => a.mjd - b.mjd);
+  }
+
+  const bands = ["c", "o"] as const;
+  const cadence = 2.6;
+  const epochStart = 1.4;
+  const epochs = Math.min(7, Math.max(4, Math.ceil(span / cadence)));
+  for (let epoch = 0; epoch < epochs; epoch += 1) {
+    const t = epochStart + epoch * cadence;
+    for (const band of bands) {
+      const mjd = minMjd + t + (band === "o" ? 0.28 : 0);
+      const fade = epoch * 0.075;
+      const bandOffset = band === "c" ? 0.07 : 0.03;
+      const jitter = (detHashU01(`${objectKey}|ATLAS|${epoch}|${band}`) - 0.5) * 0.16;
+      const mag = refMag - fade + bandOffset + jitter;
+      const magErr = 0.035 + detHashU01(`${objectKey}|ATLAS|err|${epoch}|${band}`) * 0.07;
+      out.push(attachFluxToPoint({ mjd, band, mag, magErr }));
+    }
+  }
+  return out.sort((a, b) => a.mjd - b.mjd);
+}
+
+function syntheticSurveyPhotometry(object: TransientObject, survey: SurveyId): PhotometryPoint[] {
+  return generateSurveyDetections(syntheticPhotometry(object), survey, object.lasairId);
+}
+
+function formatFluxTick(flux: number): string {
+  if (!Number.isFinite(flux) || flux <= 0) {
+    return "—";
+  }
+  return flux.toExponential(1);
+}
+
+function formatLogFluxTick(logFlux: number): string {
+  if (!Number.isFinite(logFlux)) {
+    return "—";
+  }
+  return logFlux.toFixed(2);
+}
+
+
+type PlottedPhotometryPoint = PhotometryPoint & { survey: SurveyId };
 
 function objectRaDecDegrees(object: TransientObject): { ra: number; dec: number } {
   const ra = parseFloat(object.ra);
@@ -341,6 +569,115 @@ function syntheticPhotometry(object: TransientObject): PhotometryPoint[] {
 function mjdToUtcCalendarDay(mjd: number): string {
   const ms = (mjd - 40587) * 86400000;
   return new Date(ms).toISOString().slice(0, 10);
+}
+
+/** MJD at UTC noon for a calendar day (inverse of `mjdToUtcCalendarDay`). */
+function utcCalendarDayToMjd(day: string): number {
+  const ms = Date.parse(`${day}T12:00:00.000Z`);
+  if (Number.isNaN(ms)) {
+    return Number.NaN;
+  }
+  return ms / 86400000 + 40587;
+}
+
+function normalizeClassProbMap(raw: Record<string, number>): Record<ObjectClass, number> {
+  const weights: Record<string, number> = {};
+  for (const cls of NEEDLE_SCORE_CLASSES) {
+    const v = raw[cls];
+    weights[cls] = typeof v === "number" && v > 0 ? v : 0;
+  }
+  const sum = NEEDLE_SCORE_CLASSES.reduce((acc, cls) => acc + weights[cls], 0);
+  if (sum <= 0) {
+    const u = 1 / NEEDLE_SCORE_CLASSES.length;
+    return Object.fromEntries(NEEDLE_SCORE_CLASSES.map((cls) => [cls, u])) as Record<ObjectClass, number>;
+  }
+  return Object.fromEntries(
+    NEEDLE_SCORE_CLASSES.map((cls) => [cls, weights[cls] / sum]),
+  ) as Record<ObjectClass, number>;
+}
+
+/** One NEEDLE snapshot per UTC day when API history is unavailable (fallback demo). */
+function syntheticDailyClassificationHistory(
+  object: TransientObject,
+  minMjd: number,
+  maxMjd: number,
+): DailyClassification[] {
+  const out: DailyClassification[] = [];
+  const startDay = mjdToUtcCalendarDay(minMjd);
+  const endDay = mjdToUtcCalendarDay(maxMjd);
+  let dayMjd = utcCalendarDayToMjd(startDay);
+  const lastDayMjd = utcCalendarDayToMjd(endDay);
+  while (dayMjd <= lastDayMjd + 1e-6) {
+    const day = mjdToUtcCalendarDay(dayMjd);
+    const weights: Record<string, number> = {};
+    for (const cls of NEEDLE_SCORE_CLASSES) {
+      const base = (object.classProbabilities[cls] ?? 0) + 1e-4;
+      const wobble = 0.82 + 0.36 * detHashU01(`${object.lasairId}|${day}|${cls}`);
+      weights[cls] = base * wobble;
+    }
+    const probs = normalizeClassProbMap(weights);
+    let top: ObjectClass = "Unclear";
+    let best = -1;
+    for (const cls of NEEDLE_SCORE_CLASSES) {
+      if (probs[cls] > best) {
+        best = probs[cls];
+        top = cls;
+      }
+    }
+    out.push({
+      day,
+      classifiedAt: `${day}T12:00:00.000Z`,
+      class: top,
+      confidence: best,
+      rawProbs: probs,
+      modelVersion: object.classifiedBy?.trim() ? object.classifiedBy : "NEEDLE 2.0",
+    });
+    dayMjd += 1;
+  }
+  return out;
+}
+
+type ScoredDay = DailyClassification & {
+  mjd: number;
+  probs: Record<ObjectClass, number>;
+};
+
+function boundsFromMjds(mjds: number[]): { minMjd: number; maxMjd: number } {
+  if (!mjds.length) {
+    return { minMjd: 60775, maxMjd: 60787 };
+  }
+  const min = Math.min(...mjds);
+  const max = Math.max(...mjds);
+  const pad = Math.max((max - min) * 0.04, 0.5);
+  return { minMjd: min - pad, maxMjd: max + pad };
+}
+
+/** Map daily NEEDLE snapshots onto the LSST photometry MJD span when epochs do not overlap. */
+function alignDailyScoresToPhotometry(
+  rows: ScoredDay[],
+  lsstMinMjd: number,
+  lsstMaxMjd: number,
+): ScoredDay[] {
+  if (rows.length === 0) {
+    return rows;
+  }
+  const lsstMinDay = mjdToUtcCalendarDay(lsstMinMjd);
+  const lsstMaxDay = mjdToUtcCalendarDay(lsstMaxMjd);
+  const span = lsstMaxMjd - lsstMinMjd || 1;
+  const scoreMin = Math.min(...rows.map((row) => row.mjd));
+  const scoreMax = Math.max(...rows.map((row) => row.mjd));
+  const overlaps = scoreMax >= lsstMinMjd && scoreMin <= lsstMaxMjd;
+  if (overlaps) {
+    return rows.filter((row) => row.day >= lsstMinDay && row.day <= lsstMaxDay);
+  }
+  if (rows.length === 1) {
+    return [{ ...rows[0], mjd: lsstMinMjd + span * 0.5 }];
+  }
+  const scoreSpan = scoreMax - scoreMin || 1;
+  return rows.map((row) => ({
+    ...row,
+    mjd: lsstMinMjd + ((row.mjd - scoreMin) / scoreSpan) * span,
+  }));
 }
 
 /** Stable key for one photometry detection (one point on the light curve). */
@@ -1280,6 +1617,8 @@ function ActivePage({
           canEditStarred={canEditStarred}
         />
       );
+    case "reclassify":
+      return <ReclassifyPage object={selectedObject} />;
     case "follow-up-queue":
       return (
         <FollowUpQueue
@@ -1736,7 +2075,9 @@ function ObjectRow({
         <small>{object.tnsName ?? "N/A"}</small>
       </td>
       <td>
-        <a href={`https://lasair-ztf.lsst.ac.uk/objects/${object.lasairId}`}>Open</a>
+        <a href={lasairZtfObjectPageUrl(object.lasairId)} target="_blank" rel="noopener noreferrer">
+          Open
+        </a>
       </td>
       <td>
         {classifiedDisplay.relative}
@@ -1845,71 +2186,178 @@ type LightCurveHover = {
   clientX: number;
   clientY: number;
   utcDay: string;
+  survey: SurveyId;
   point: PhotometryPoint;
-  classification: DailyClassification | null;
 };
 
 function MultiBandLightCurve({
-  points,
-  classificationByDetection,
+  lasairId,
+  object,
+  basePhotometry,
+  classificationHistory,
+  dataSource,
 }: {
-  points: PhotometryPoint[];
-  classificationByDetection: Map<string, DailyClassification>;
+  lasairId: string;
+  object: TransientObject;
+  basePhotometry: PhotometryPoint[];
+  classificationHistory: DailyClassification[];
+  dataSource: "database" | "fallback";
 }) {
+  const [activeSurveys, setActiveSurveys] = useState<Set<SurveyId>>(() => new Set(["LSST"]));
   const [hover, setHover] = useState<LightCurveHover | null>(null);
 
-  const updateHover = (event: MouseEvent<SVGGElement>, point: PhotometryPoint) => {
-    const utcDay = mjdToUtcCalendarDay(point.mjd);
-    const key = detectionClassificationKey(point);
-    setHover({
-      clientX: event.clientX,
-      clientY: event.clientY,
-      utcDay,
-      point,
-      classification: classificationByDetection.get(key) ?? null,
+  useEffect(() => {
+    setActiveSurveys(new Set(["LSST"]));
+    setHover(null);
+  }, [lasairId, basePhotometry]);
+
+  const surveyCache = useMemo(() => {
+    const base = basePhotometry.length ? basePhotometry : syntheticPhotometry(object);
+    return {
+      LSST: generateSurveyDetections(base, "LSST", lasairId),
+      ZTF: generateSurveyDetections(base, "ZTF", lasairId),
+      ATLAS: generateSurveyDetections(base, "ATLAS", lasairId),
+    } satisfies Record<SurveyId, PhotometryPoint[]>;
+  }, [basePhotometry, object, lasairId]);
+
+  const toggleSurvey = (surveyId: SurveyId) => {
+    setActiveSurveys((prev) => {
+      const next = new Set(prev);
+      if (next.has(surveyId)) {
+        next.delete(surveyId);
+        setHover(null);
+      } else {
+        next.add(surveyId);
+      }
+      return next;
     });
   };
 
-  if (!points.length) {
+  const plottedPoints = useMemo(() => {
+    const out: PlottedPhotometryPoint[] = [];
+    for (const surveyId of activeSurveys) {
+      const pts = surveyCache[surveyId];
+      if (!pts?.length) {
+        continue;
+      }
+      for (const point of pts) {
+        out.push({ ...point, survey: surveyId });
+      }
+    }
+    return out;
+  }, [activeSurveys, surveyCache]);
+
+  const axisReferencePoints = plottedPoints;
+  const showLcPlot = plottedPoints.length > 0;
+
+  const legendEntries = useMemo(() => {
+    const seen = new Set<string>();
+    const entries: Array<{ key: string; survey: SurveyId; band: string }> = [];
+    for (const point of plottedPoints) {
+      const band = (point.band || "?").toLowerCase();
+      const key = `${point.survey}:${band}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      entries.push({ key, survey: point.survey, band });
+    }
+    return entries;
+  }, [plottedPoints]);
+
+  const lsstReferencePoints = useMemo(() => surveyCache.LSST, [surveyCache.LSST]);
+
+  const lcMjdBounds = useMemo(() => {
+    const photMjds = axisReferencePoints.map((point) => point.mjd);
+    if (!photMjds.length) {
+      return { minMjd: 60775, maxMjd: 60787 };
+    }
+    return boundsFromMjds(photMjds);
+  }, [axisReferencePoints]);
+
+  const { scoreMjdBounds, dailyScores } = useMemo(() => {
+    const lsstMjds = lsstReferencePoints.map((point) => point.mjd);
+    const lsstMinMjd = lsstMjds.length ? Math.min(...lsstMjds) : 60775;
+    const lsstMaxMjd = lsstMjds.length ? Math.max(...lsstMjds) : 60787;
+
+    let history = classificationHistory;
+    if (!history.length && dataSource === "fallback") {
+      history = syntheticDailyClassificationHistory(object, lsstMinMjd, lsstMaxMjd);
+    }
+
+    const mapped = history
+      .map((row) => ({
+        ...row,
+        mjd: utcCalendarDayToMjd(row.day),
+        probs: normalizeClassProbMap(row.rawProbs),
+      }))
+      .filter((row) => Number.isFinite(row.mjd))
+      .sort((a, b) => a.mjd - b.mjd);
+
+    const aligned = alignDailyScoresToPhotometry(mapped, lsstMinMjd, lsstMaxMjd);
+    const scoreMjds = [...lsstMjds, ...aligned.map((row) => row.mjd)];
+
+    return {
+      scoreMjdBounds: boundsFromMjds(scoreMjds),
+      dailyScores: aligned,
+    };
+  }, [lsstReferencePoints, classificationHistory, dataSource, object]);
+
+  const hasNeedleScorePanel = lsstReferencePoints.length > 0;
+
+  const updateHover = (event: MouseEvent<SVGGElement>, survey: SurveyId, point: PhotometryPoint) => {
+    setHover({
+      clientX: event.clientX,
+      clientY: event.clientY,
+      utcDay: mjdToUtcCalendarDay(point.mjd),
+      survey,
+      point,
+    });
+  };
+
+  if (!basePhotometry.length && !Object.values(surveyCache).some((pts) => pts.length > 0)) {
     return <p className="muted-value">No photometry loaded for this object.</p>;
   }
 
-  const mjds = points.map((p) => p.mjd);
-  const mags = points.map((p) => p.mag);
-  const minMjd = Math.min(...mjds);
-  const maxMjd = Math.max(...mjds);
-  const minMag = Math.min(...mags) - 0.2;
-  const maxMag = Math.max(...mags) + 0.2;
   const padL = 54;
-  const padR = 12;
-  const padT = 16;
-  const padB = 48;
+  const padR = 52;
   const W = 468;
-  const H = 252;
+  const lcPadT = 16;
+  const lcInnerH = 210;
+  const lcAxisH = 22;
+  const panelGap = 10;
+  const scorePadT = 12;
+  const scoreInnerH = 140;
+  const scoreAxisH = 22;
+  const lcTop = lcPadT;
+  const lcBottom = lcTop + lcInnerH;
+  const lcAxisBottom = lcBottom + lcAxisH;
+  const scoreTop = lcAxisBottom + panelGap + scorePadT;
+  const scoreBottom = scoreTop + scoreInnerH;
+  const H = scoreBottom + scoreAxisH + 8;
   const innerW = W - padL - padR;
-  const innerH = H - padT - padB;
-  const spanMjd = maxMjd - minMjd || 1;
-  const spanMag = maxMag - minMag || 1;
-  const xScale = (mj: number) => padL + ((mj - minMjd) / spanMjd) * innerW;
-  const yScale = (magVal: number) => padT + ((magVal - minMag) / spanMag) * innerH;
 
-  const byBand = new Map<string, PhotometryPoint[]>();
-  for (const p of points) {
-    const b = (p.band || "?").toLowerCase();
-    if (!byBand.has(b)) {
-      byBand.set(b, []);
-    }
-    byBand.get(b)!.push(p);
-  }
-  for (const arr of byBand.values()) {
-    arr.sort((a, b) => a.mjd - b.mjd);
-  }
+  const fluxes = axisReferencePoints.map((p) => p.flux ?? magToFlux(p.mag));
+  const { minMjd: lcMinMjd, maxMjd: lcMaxMjd } = lcMjdBounds;
+  const { minMjd: scoreMinMjd, maxMjd: scoreMaxMjd } = scoreMjdBounds;
+  const logFluxes = fluxes.length
+    ? fluxes.map((flux) => Math.log10(Math.max(flux, 1e-12)))
+    : [Math.log10(magToFlux(20)), Math.log10(magToFlux(19))];
+  const minLogFlux = Math.min(...logFluxes) - 0.08;
+  const maxLogFlux = Math.max(...logFluxes) + 0.08;
+  const lcSpanMjd = lcMaxMjd - lcMinMjd || 1;
+  const scoreSpanMjd = scoreMaxMjd - scoreMinMjd || 1;
+  const spanLogFlux = maxLogFlux - minLogFlux || 1;
+  const xScaleLc = (mj: number) => padL + ((mj - lcMinMjd) / lcSpanMjd) * innerW;
+  const xScaleScore = (mj: number) => padL + ((mj - scoreMinMjd) / scoreSpanMjd) * innerW;
+  const yLogFluxScale = (logFlux: number) => lcTop + ((maxLogFlux - logFlux) / spanLogFlux) * lcInnerH;
+  const yProbScale = (prob: number) => scoreTop + (1 - prob) * scoreInnerH;
 
   const gridT = [0, 0.25, 0.5, 0.75, 1];
   const vw = typeof globalThis.window !== "undefined" ? globalThis.window.innerWidth : 1024;
   const vh = typeof globalThis.window !== "undefined" ? globalThis.window.innerHeight : 768;
   const cardW = 288;
-  const cardH = 220;
+  const cardH = 240;
   const hoverPosition =
     hover &&
     (() => {
@@ -1918,11 +2366,12 @@ function MultiBandLightCurve({
       return { left, top };
     })();
 
+  const hoverFlux = hover ? hover.point.flux ?? magToFlux(hover.point.mag) : null;
+  const hoverFluxErr = hover && hoverFlux != null ? hover.point.fluxErr ?? undefined : undefined;
+  const hoverLogFlux = hoverFlux != null ? Math.log10(Math.max(hoverFlux, 1e-12)) : null;
+
   return (
-    <div
-      className="lightcurve-chart-wrap"
-      onMouseLeave={() => setHover(null)}
-    >
+    <div className="lightcurve-chart-wrap" onMouseLeave={() => setHover(null)}>
       {hover && hoverPosition ? (
         <div
           className="lightcurve-hover-card"
@@ -1930,7 +2379,7 @@ function MultiBandLightCurve({
           style={{ left: hoverPosition.left, top: hoverPosition.top }}
         >
           <div className="lightcurve-hover-section">
-            <h5 className="lightcurve-hover-title">Detection</h5>
+            <h5 className="lightcurve-hover-title">Detection ({hover.survey})</h5>
             <p className="lightcurve-hover-meta">
               MJD {hover.point.mjd.toFixed(4)} · UTC day {hover.utcDay}
             </p>
@@ -1941,146 +2390,342 @@ function MultiBandLightCurve({
                 ? ` ± ${hover.point.magErr.toFixed(3)}`
                 : null}
             </p>
-          </div>
-          <div className="lightcurve-hover-section lightcurve-hover-section--needle">
-            <h5 className="lightcurve-hover-title">NEEDLE (this detection)</h5>
-            {hover.classification ? (
-              <>
-                <p className="lightcurve-hover-class-row">
-                  <Badge
-                    label={hover.classification.class}
-                    tone={classColor[hover.classification.class as ObjectClass] ?? "slate"}
-                  />
-                  <span className="lightcurve-hover-conf">
-                    {Math.round(hover.classification.confidence * 100)}% conf.
-                  </span>
-                </p>
-                <p className="lightcurve-hover-meta">
-                  {hover.classification.modelVersion}
-                  <time dateTime={hover.classification.classifiedAt}>
-                    {" "}
-                    · {formatCommentTime(hover.classification.classifiedAt)}
-                  </time>
-                </p>
-                <ul className="lightcurve-hover-probs">
-                  {Object.entries(hover.classification.rawProbs)
-                    .sort((a, b) => b[1] - a[1])
-                    .map(([k, v]) => (
-                      <li key={k}>
-                        {k}: {(v * 100).toFixed(1)}%
-                      </li>
-                    ))}
-                </ul>
-              </>
-            ) : (
-              <p className="lightcurve-hover-none">No classification computed for this point.</p>
-            )}
+            {hoverFlux != null ? (
+              <p className="lightcurve-hover-meta">
+                Flux <strong>{formatFluxTick(hoverFlux)}</strong>
+                {hoverFluxErr != null && Number.isFinite(hoverFluxErr)
+                  ? ` ± ${formatFluxTick(hoverFluxErr)}`
+                  : null}
+                {hoverLogFlux != null ? ` · log₁₀(flux) ${formatLogFluxTick(hoverLogFlux)}` : null}
+              </p>
+            ) : null}
           </div>
         </div>
       ) : null}
-      <svg className="lightcurve-svg" viewBox={`0 0 ${W} ${H}`} role="img" aria-label="Multi-band light curve">
-        <title>Light curve from photometry JSON</title>
-        {gridT.map((t) => {
-          const mj = minMjd + t * spanMjd;
-          const x = xScale(mj);
-          return (
-            <g key={`gx-${t}`}>
-              <line
-                x1={x}
-                y1={padT}
-                x2={x}
-                y2={H - padB}
-                stroke="rgba(148,163,184,0.14)"
-                strokeWidth={1}
-              />
-              <text x={x} y={H - padB + 16} textAnchor="middle" fill="#94a3b8" fontSize={9}>
-                {mj.toFixed(2)}
-              </text>
-            </g>
-          );
-        })}
-        {gridT.map((t) => {
-          const magVal = minMag + t * spanMag;
-          const y = yScale(magVal);
-          return (
-            <g key={`gy-${t}`}>
-              <line
-                x1={padL}
-                y1={y}
-                x2={W - padR}
-                y2={y}
-                stroke="rgba(148,163,184,0.14)"
-                strokeWidth={1}
-              />
-              <text x={padL - 8} y={y + 4} textAnchor="end" fill="#94a3b8" fontSize={9}>
-                {magVal.toFixed(2)}
-              </text>
-            </g>
-          );
-        })}
-        <text
-          x={padL + innerW / 2}
-          y={H - 4}
-          textAnchor="middle"
-          fill="#94a3b8"
-          fontSize={10}
-          fontWeight={600}
-          className="chart-axis-title"
-        >
-          Modified Julian Date (MJD)
-        </text>
-        <text
-          transform={`translate(13, ${padT + innerH / 2}) rotate(-90)`}
-          textAnchor="middle"
-          fill="#94a3b8"
-          fontSize={10}
-          fontWeight={600}
-          className="chart-axis-title"
-        >
-          Magnitude (mag)
-        </text>
-        {[...byBand.entries()].map(([band, pts]) => {
-          const color = LC_BAND_COLORS[band] ?? LC_BAND_COLORS.default;
-          const d = pts
-            .map((p, i) => `${i === 0 ? "M" : "L"} ${xScale(p.mjd)} ${yScale(p.mag)}`)
-            .join(" ");
-          return <path key={`line-${band}`} d={d} fill="none" stroke={color} strokeWidth={2} strokeLinejoin="round" />;
-        })}
-        {[...byBand.entries()].flatMap(([band, pts]) =>
-          pts.map((p, i) => (
-            <g
-              key={`${band}-${i}-${p.mjd}`}
-              onMouseEnter={(e) => updateHover(e, p)}
-              onMouseMove={(e) => updateHover(e, p)}
+      <svg
+        className="lightcurve-svg lightcurve-svg--stacked"
+        viewBox={`0 0 ${W} ${H}`}
+        role="img"
+        aria-label="Multi-survey light curve and daily NEEDLE class scores"
+      >
+        <title>Light curve and daily NEEDLE scores</title>
+        <defs>
+          <clipPath id={`lc-panel-${lasairId}`}>
+            <rect x={padL} y={lcTop} width={innerW} height={lcInnerH} />
+          </clipPath>
+          <clipPath id={`score-panel-${lasairId}`}>
+            <rect x={padL} y={scoreTop} width={innerW} height={scoreInnerH} />
+          </clipPath>
+        </defs>
+        <rect x={padL} y={lcTop} width={innerW} height={lcInnerH} fill="transparent" />
+        <rect x={padL} y={scoreTop} width={innerW} height={scoreInnerH} fill="rgba(2,6,23,0.35)" rx={4} />
+        {hasNeedleScorePanel && dailyScores.length > 0 ? (
+          <text x={padL + 4} y={scoreTop - 4} fill="#64748b" fontSize={8.5} fontWeight={600}>
+            NEEDLE-LSST class scores (daily)
+          </text>
+        ) : null}
+        {showLcPlot
+          ? gridT.map((t) => {
+              const mj = lcMinMjd + t * lcSpanMjd;
+              const x = xScaleLc(mj);
+              return (
+                <g key={`lc-gx-${t}`}>
+                  <line
+                    x1={x}
+                    y1={lcTop}
+                    x2={x}
+                    y2={lcBottom}
+                    stroke="rgba(148,163,184,0.14)"
+                    strokeWidth={1}
+                  />
+                  <text x={x} y={lcBottom + 14} textAnchor="middle" fill="#94a3b8" fontSize={9}>
+                    {mj.toFixed(2)}
+                  </text>
+                </g>
+              );
+            })
+          : null}
+        {hasNeedleScorePanel
+          ? gridT.map((t) => {
+              const mj = scoreMinMjd + t * scoreSpanMjd;
+              const x = xScaleScore(mj);
+              return (
+                <g key={`score-gx-${t}`}>
+                  <line
+                    x1={x}
+                    y1={scoreTop}
+                    x2={x}
+                    y2={scoreBottom}
+                    stroke="rgba(148,163,184,0.14)"
+                    strokeWidth={1}
+                  />
+                  <text x={x} y={scoreBottom + 14} textAnchor="middle" fill="#94a3b8" fontSize={9}>
+                    {mj.toFixed(2)}
+                  </text>
+                </g>
+              );
+            })
+          : null}
+        {showLcPlot
+          ? gridT.map((t) => {
+              const logFluxVal = minLogFlux + t * spanLogFlux;
+              const magVal = fluxToMag(10 ** logFluxVal);
+              const y = yLogFluxScale(logFluxVal);
+              return (
+                <g key={`gy-flux-${t}`}>
+                  <line
+                    x1={padL}
+                    y1={y}
+                    x2={W - padR}
+                    y2={y}
+                    stroke="rgba(148,163,184,0.1)"
+                    strokeWidth={1}
+                  />
+                  <text x={padL - 8} y={y + 4} textAnchor="end" fill="#94a3b8" fontSize={9}>
+                    {magVal.toFixed(2)}
+                  </text>
+                  <text x={W - padR + 8} y={y + 4} textAnchor="start" fill="#67e8f9" fontSize={8.5}>
+                    {formatLogFluxTick(logFluxVal)}
+                  </text>
+                </g>
+              );
+            })
+          : (
+            <text x={padL + innerW / 2} y={lcTop + lcInnerH / 2} textAnchor="middle" fill="#64748b" fontSize={10}>
+              Select one or more surveys to show photometry
+            </text>
+          )}
+        <line
+          x1={padL}
+          y1={lcAxisBottom + panelGap / 2}
+          x2={W - padR}
+          y2={lcAxisBottom + panelGap / 2}
+          stroke="rgba(148,163,184,0.22)"
+          strokeWidth={1}
+        />
+        {hasNeedleScorePanel
+          ? gridT.map((t) => {
+              const prob = 1 - t;
+              const y = yProbScale(prob);
+              return (
+                <g key={`gy-prob-${t}`}>
+                  <line
+                    x1={padL}
+                    y1={y}
+                    x2={W - padR}
+                    y2={y}
+                    stroke="rgba(148,163,184,0.1)"
+                    strokeWidth={1}
+                  />
+                  <text x={padL - 8} y={y + 3} textAnchor="end" fill="#94a3b8" fontSize={8.5}>
+                    {(prob * 100).toFixed(0)}%
+                  </text>
+                </g>
+              );
+            })
+          : null}
+        {showLcPlot ? (
+          <text
+            x={padL + innerW / 2}
+            y={lcBottom + 28}
+            textAnchor="middle"
+            fill="#94a3b8"
+            fontSize={10}
+            fontWeight={600}
+            className="chart-axis-title"
+          >
+            Modified Julian Date (MJD)
+          </text>
+        ) : null}
+        {showLcPlot ? (
+          <>
+            <text
+              transform={`translate(13, ${lcTop + lcInnerH / 2}) rotate(-90)`}
+              textAnchor="middle"
+              fill="#94a3b8"
+              fontSize={10}
+              fontWeight={600}
+              className="chart-axis-title"
             >
-              <circle
-                cx={xScale(p.mjd)}
-                cy={yScale(p.mag)}
-                r={12}
-                fill="transparent"
-                className="lightcurve-hit"
-              />
-              <circle
-                cx={xScale(p.mjd)}
-                cy={yScale(p.mag)}
-                r={3.5}
-                fill={LC_BAND_COLORS[band] ?? LC_BAND_COLORS.default}
-                stroke="rgba(15,23,42,0.85)"
-                strokeWidth={1}
+              Magnitude (mag)
+            </text>
+            <text
+              transform={`translate(${W - 10}, ${lcTop + lcInnerH / 2}) rotate(90)`}
+              textAnchor="middle"
+              fill="#67e8f9"
+              fontSize={10}
+              fontWeight={600}
+              className="chart-axis-title"
+            >
+              log₁₀(flux)
+            </text>
+          </>
+        ) : null}
+        <text
+          transform={`translate(13, ${scoreTop + scoreInnerH / 2}) rotate(-90)`}
+          textAnchor="middle"
+          fill="#94a3b8"
+          fontSize={10}
+          fontWeight={600}
+          className="chart-axis-title"
+        >
+          Class probability
+        </text>
+        {hasNeedleScorePanel ? (
+          <text
+            x={padL + innerW / 2}
+            y={H - 2}
+            textAnchor="middle"
+            fill="#94a3b8"
+            fontSize={10}
+            fontWeight={600}
+            className="chart-axis-title"
+          >
+            MJD (NEEDLE · LSST)
+          </text>
+        ) : null}
+        {!hasNeedleScorePanel ? (
+          <text x={padL + innerW / 2} y={scoreTop + scoreInnerH / 2} textAnchor="middle" fill="#64748b" fontSize={10}>
+            No LSST photometry for NEEDLE scores
+          </text>
+        ) : dailyScores.length === 0 ? (
+          <text x={padL + innerW / 2} y={scoreTop + scoreInnerH / 2} textAnchor="middle" fill="#64748b" fontSize={10}>
+            No daily NEEDLE history for this object
+          </text>
+        ) : (
+          <g clipPath={`url(#score-panel-${lasairId})`}>
+            {NEEDLE_SCORE_CLASSES.map((cls) => {
+              const stroke = NEEDLE_CLASS_STROKE[cls];
+              const d = dailyScores
+                .map((row, index) => {
+                  const x = xScaleScore(row.mjd);
+                  const y = yProbScale(row.probs[cls]);
+                  return `${index === 0 ? "M" : "L"} ${x} ${y}`;
+                })
+                .join(" ");
+              return (
+                <g key={`needle-line-${cls}`}>
+                  <path
+                    d={d}
+                    fill="none"
+                    stroke={stroke}
+                    strokeWidth={1.6}
+                    strokeLinejoin="round"
+                    strokeLinecap="round"
+                    opacity={0.92}
+                  />
+                  {dailyScores.map((row) => (
+                    <circle
+                      key={`needle-dot-${cls}-${row.day}`}
+                      cx={xScaleScore(row.mjd)}
+                      cy={yProbScale(row.probs[cls])}
+                      r={2.2}
+                      fill={stroke}
+                      opacity={0.95}
+                    />
+                  ))}
+                </g>
+              );
+            })}
+          </g>
+        )}
+        <g clipPath={`url(#lc-panel-${lasairId})`}>
+        {showLcPlot
+          ? plottedPoints.map((p, i) => {
+          const band = (p.band || "?").toLowerCase();
+          const color = LC_BAND_COLORS[band] ?? LC_BAND_COLORS.default;
+          const symbolStyle = SURVEY_SYMBOLS[p.survey];
+          const markerSize = p.survey === "ATLAS" ? 3.2 : p.survey === "ZTF" ? 3 : 3.4;
+          const flux = p.flux ?? magToFlux(p.mag);
+          const logFlux = Math.log10(Math.max(flux, 1e-12));
+          const fluxErr = p.fluxErr;
+          const x = xScaleLc(p.mjd);
+          const y = yLogFluxScale(logFlux);
+          const yTop =
+            fluxErr != null && Number.isFinite(fluxErr)
+              ? yLogFluxScale(Math.log10(Math.max(flux + fluxErr, 1e-12)))
+              : y;
+          const yBottom =
+            fluxErr != null && Number.isFinite(fluxErr)
+              ? yLogFluxScale(Math.log10(Math.max(flux - fluxErr, 1e-12)))
+              : y;
+          return (
+            <g
+              key={`${p.survey}-${band}-${i}-${p.mjd}`}
+              onMouseEnter={(e) => updateHover(e, p.survey, p)}
+              onMouseMove={(e) => updateHover(e, p.survey, p)}
+            >
+              {fluxErr != null && Number.isFinite(fluxErr) && yTop !== yBottom ? (
+                <line
+                  x1={x}
+                  y1={yTop}
+                  x2={x}
+                  y2={yBottom}
+                  stroke={color}
+                  strokeWidth={1.4}
+                  strokeOpacity={0.88}
+                  strokeDasharray={symbolStyle.dash}
+                  className="lightcurve-point"
+                />
+              ) : null}
+              <circle cx={x} cy={y} r={12} fill="transparent" className="lightcurve-hit" />
+              <LightCurveSurveySymbol
+                survey={p.survey}
+                x={x}
+                y={y}
+                size={markerSize}
+                fill={color}
                 className="lightcurve-point"
               />
             </g>
-          )),
-        )}
+          );
+        })
+          : null}
+        </g>
       </svg>
-      <ul className="lightcurve-legend">
-        {[...byBand.keys()].map((b) => (
-          <li key={b}>
-            <span className="legend-swatch" style={{ background: LC_BAND_COLORS[b] ?? LC_BAND_COLORS.default }} />
-            {b}
+      <div className="lightcurve-survey-tabs" role="tablist" aria-label="Survey photometry source">
+        {(["LSST", "ZTF", "ATLAS"] as const).map((id) => (
+          <button
+            key={id}
+            type="button"
+            role="tab"
+            aria-selected={activeSurveys.has(id)}
+            className={activeSurveys.has(id) ? "active" : "ghost"}
+            onClick={() => toggleSurvey(id)}
+          >
+            {id}
+          </button>
+        ))}
+      </div>
+      <ul className="lightcurve-survey-key" aria-label="Survey marker shapes">
+        {(["LSST", "ZTF", "ATLAS"] as const).map((survey) => (
+          <li key={survey}>
+            <LightCurveLegendSymbol survey={survey} fill="#cbd5e1" />
+            {survey}
           </li>
         ))}
       </ul>
+      <ul className="lightcurve-legend">
+        {legendEntries.map(({ key, survey, band }) => (
+          <li key={key}>
+            <LightCurveLegendSymbol
+              survey={survey}
+              fill={LC_BAND_COLORS[band] ?? LC_BAND_COLORS.default}
+            />
+            {survey} · {band}
+          </li>
+        ))}
+      </ul>
+      {hasNeedleScorePanel && dailyScores.length > 0 ? (
+        <ul className="lightcurve-legend lightcurve-legend--needle" aria-label="NEEDLE class score lines">
+          {NEEDLE_SCORE_CLASSES.map((cls) => (
+            <li key={cls}>
+              <span className="needle-class-line" style={{ background: NEEDLE_CLASS_STROKE[cls] }} />
+              {cls}
+            </li>
+          ))}
+        </ul>
+      ) : null}
     </div>
   );
 }
@@ -2350,11 +2995,6 @@ function ObjectDetail({
     return pts;
   }, [detailPhotometry, dataSource, object]);
 
-  const classificationByDetection = useMemo(
-    () => buildClassificationByDetection(photometry, object, dataSource, detailHistory),
-    [photometry, object, dataSource, detailHistory],
-  );
-
   const sortedProbs = useMemo(
     () => Object.entries(object.classProbabilities).sort((a, b) => b[1] - a[1]),
     [object.classProbabilities],
@@ -2448,14 +3088,52 @@ function ObjectDetail({
               <dt>Dec (°)</dt>
               <dd>{Number.isFinite(dec) ? (dec >= 0 ? `+${dec.toFixed(6)}` : dec.toFixed(6)) : object.dec}</dd>
             </div>
+     
+
             <div>
               <dt>TNS class</dt>
               <dd>{object.tnsClass ?? "—"}</dd>
             </div>
             <div>
+              
               <dt>TNS name</dt>
-              <dd>{object.tnsName ?? "—"}</dd>
+              <dd>
+                
+                <a href={tnsObjectPageUrl(object.ra, object.dec)} target="_blank" rel="noopener noreferrer">
+                {object.tnsName ?? "—"}
+                </a>
+              </dd>
             </div>
+            <div>
+              <dt>Brokers' URLs</dt>
+              <dd>
+              <a
+                  href={lasairZtfObjectPageUrl(object.lasairId)}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  Lasair 
+                </a>
+                {", "}
+                <a
+                  href={finkObjectPageUrl(object.lasairId)}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  Fink 
+                </a>
+                {", "}
+                <a
+                  href={alerceObjectPageUrl(object.lasairId)}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  Alerce
+                </a>
+      
+              </dd>
+            </div>
+            
             <div>
               <dt>NEEDLE class</dt>
               <dd>
@@ -2476,14 +3154,23 @@ function ObjectDetail({
           </div> */}
         </Panel>
 
-        <Panel title="Light curve" eyebrow="Photometry & per-detection NEEDLE predictions">
+        <Panel title="Light curve" eyebrow="Photometry & daily NEEDLE scores">
           <p className="detail-cadence-note">
-            Class probabilities for each available detection are estimated from NEEDLE 2.0 model output from the discovery day to current detection day with step size of 1 day at minima. Hover any point for detection metadata and the full probability vector.
+            Photometry can be overlaid from multiple surveys (upper panel). NEEDLE-LSST daily class scores use a
+            fixed LSST timeline (lower panel) and do not shift when toggling other surveys. Use Re-classify to
+            merge additional survey data into a new NEEDLE run.
           </p>
           {dataSource === "database" && detailLoadState === "loading" ? (
             <p className="muted-value">Loading photometry…</p>
-          ) : null}
-          <MultiBandLightCurve points={photometry} classificationByDetection={classificationByDetection} />
+          ) : (
+            <MultiBandLightCurve
+              lasairId={object.lasairId}
+              object={object}
+              basePhotometry={photometry}
+              classificationHistory={detailHistory}
+              dataSource={dataSource}
+            />
+          )}
           <div className="detail-prob-block detail-prob-block--below-curve">
             <h4 className="detail-subheading">Latest class probabilities:</h4>
             <div className="detail-prob-table-wrap">
@@ -2512,6 +3199,12 @@ function ObjectDetail({
                 </tbody>
               </table>
             </div>
+            <a
+              href={`#reclassify?lasairId=${encodeURIComponent(object.lasairId)}`}
+              className="floating-action"
+            >
+              Re-classify and visualize with selected surveys
+            </a>
           </div>
         </Panel>
 
@@ -2596,9 +3289,7 @@ function ObjectDetail({
           </div>
         </Panel>
       </div>
-      <button type="button" className="floating-action">
-        Re-classify with NEEDLE 2.0
-      </button>
+      
     </Section>
   );
 }

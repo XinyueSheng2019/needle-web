@@ -150,3 +150,12 @@ If the feature is **UI-only** (no DB), start in `src/App.tsx` with local/fake st
 - `App.tsx` — what users see and do.
 
 Together, that is enough to navigate the repo and put new behavior in the right layer on the first try.
+
+
+### function design
+
+#### TAGS
+- transient tags: star, promote, follow-up, snooze;
+- for follow-ups, four priorities: High, medium, low, monitor 
+- `snooze` is to remove the present of false positives, once it is removed, user can still find it via the search bar; if the classification outlier score increase 0.3, the object will return to the object list.
+- `monitor` is to monitor the high-confidence candidates with few detections, and need more detections to ensure the priority; user can pair this tag with revisit function via setting the time interval to check again.

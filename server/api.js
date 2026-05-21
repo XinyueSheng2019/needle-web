@@ -120,6 +120,22 @@ function ztfFidToBand(fid) {
  * NEEDLE `mag_sets_v4` export: `{ objectId, objectData?, candidates: [{ mjd, magpsf, sigmapsf, fid, ... }] }`.
  * Candidates are flattened to `{ mjd, band, mag, magErr }` for the light-curve API.
  */
+
+function magToFlux(mag) {
+  return Math.pow(10, -0.4 * mag);
+}
+function magErrToFluxErr(flux, magErr) {
+  return flux * (Math.LN10 / 2.5) * magErr;
+}
+function attachFluxFields(point) {
+  const flux = Number.isFinite(point.flux) ? point.flux : magToFlux(point.mag);
+  const magErr = Number.isFinite(point.magErr) ? point.magErr : undefined;
+  const fluxErr =
+    Number.isFinite(point.fluxErr) ? point.fluxErr :
+    magErr != null ? magErrToFluxErr(flux, magErr) : undefined;
+  return { ...point, flux, fluxErr };
+}
+
 function photometryFromMagSetsV4(raw) {
   if (!raw || typeof raw !== "object" || !Array.isArray(raw.candidates)) {
     return null;
@@ -142,12 +158,46 @@ function photometryFromMagSetsV4(raw) {
 /**
  * Normalizes stored photometry JSON: mag_sets_v4 object, flat array, or `{ points: [...] }`.
  */
+
+function fetchZTFPhotometry(ra, dec) {
+  return null;
+}
+
+function fetchLSSTPhotometry(ra, dec) {
+  return null;
+}
+
+function fetchATLASPhotometry(ra, dec) {
+  return null;
+}
+
+function transformPhotometryForSurvey(ra, dec, survey) {
+  if (survey === "ZTF") {
+    return fetchZTFPhotometry(ra, dec); // fetch ZTF photometry from Lasair
+  }
+  else if (survey === "LSST") {
+    return detail.photometry; //this is default.
+  }
+  else if (survey === "ATLAS") {
+    return fetchATLASPhotometry(ra, dec); //fetch ATLAS data from force-atlas2
+  }
+  return detail.photometry; //this is default.
+}
+
+
+async function getSurveyPhotometry(lasairId, survey) {
+  const detail = await getObjectDetail(lasairId);
+  if (!detail) return null;
+  return transformPhotometryForSurvey(detail.ra, detail.dec, survey);
+}
+
+
 function normalizePhotometryJson(raw) {
   const fromMagSets = photometryFromMagSetsV4(raw);
   if (fromMagSets) {
     return fromMagSets;
   }
-  const list = Array.isArray(raw) ? raw : raw && typeof raw === "object" && Array.isArray(raw.points) ? raw.points : [];
+  const list = Array.isArray(raw) ? raw : raw && typeof raw === "object" && Array.isArray(raw.points) ? attachFluxFields(raw.points) : [];
   return list
     .map((p) => ({
       mjd: Number(p.mjd),
@@ -919,6 +969,21 @@ async function getDashboard() {
  * To add a new endpoint manually, add an `if` block here that checks `url.pathname` and calls a helper function.
  */
 async function handleRequest(request, response) {
+
+  const photometryMatch = url.pathname.match(/^\/api\/objects\/(.+)\/photometry$/);
+if (request.method === "GET" && photometryMatch) {
+  const lasairId = decodeURIComponent(photometryMatch[1]);
+  const survey = (url.searchParams.get("survey") ?? "LSST").toUpperCase();
+  const points = await getSurveyPhotometry(lasairId, survey);
+  if (!points) {
+    sendJson(response, 404, { error: "Object not found" });
+    return;
+  }
+  sendJson(response, 200, { survey, points });
+  return;
+}
+
+
   if (request.method === "OPTIONS") {
     sendJson(response, 204, {});
     return;
